@@ -1,6 +1,7 @@
 import io
 import os
 import re
+from datetime import date
 import openpyxl
 import pandas as pd
 import streamlit as st
@@ -14,21 +15,27 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
+    .block-container { padding-top: 1.1rem; padding-bottom: 2rem; }
     div[data-testid="stMetric"] {
         background-color: #f8fafc;
         border: 1px solid #e2e8f0;
-        padding: 14px 18px;
+        padding: 12px 16px;
         border-radius: 10px;
     }
     .section-title {
-        font-size: 1.2rem;
+        font-size: 1.15rem;
         font-weight: 700;
         color: #1e293b;
         margin-top: 1rem;
         margin-bottom: 0.5rem;
         border-left: 4px solid #2563eb;
         padding-left: 10px;
+    }
+    .new-sku-box {
+        background-color: #f0f9ff;
+        border: 1px solid #bae6fd;
+        border-radius: 10px;
+        padding: 12px 14px;
     }
     </style>
     """,
@@ -37,8 +44,26 @@ st.markdown(
 
 DEFAULT_MASTER_FILE = "브랜드_제품코드_마스터.xlsx"
 FALLBACK_MASTER_FILE = "통합 문서1.xlsx"
+NEW_SKU_TEMPLATE_FILE = "신규_제품코드_등록양식.xlsx"
+EXCLUDED_KEYWORDS = ("겔", "베르가못", "플라스타", "플라스마")
+
+# 1번 첨부사진(아크네스 화이트 티트리 다이소 라인 6개 SKU)
+DAISO_ACNES_CODES = {
+    "ME00621DCP",
+    "ME00621DFC",
+    "ME00621DSE",
+    "ME00621DTF",
+    "ME00621DTP",
+    "ME00621DTT",
+}
 
 PORTFOLIO_OPTIONS = {
+    "다이소-아크네스": [
+        "클렌징",
+        "스팟패치",
+        "스킨케어",
+        "미분류(확인필요)",
+    ],
     "Acnes": [
         "클렌징",
         "스팟패치",
@@ -67,6 +92,7 @@ PORTFOLIO_OPTIONS = {
 }
 
 BRAND_CHOICES = [
+    "다이소-아크네스",
     "Acnes",
     "Lipcare",
     "HADALABO",
@@ -82,117 +108,6 @@ BRAND_CHOICES = [
 ]
 
 
-def classify_portfolio(brand: str, product_name: str) -> tuple[str, str, str]:
-    name = str(product_name or "").strip()
-    name_clean = re.sub(r"\s+", "", name).lower()
-
-    if brand == "Acnes":
-        if "포맨" in name_clean or "formen" in name_clean:
-            return "포 맨", "✅ 정상매칭", "이미지(포 맨) 라인 일치"
-
-        if "더마릴리프" in name_clean or "더마" in name_clean:
-            if any(k in name_clean for k in ["클렌저", "워시", "폼"]):
-                return "클렌징", "✅ 정상매칭", "이미지(클렌징-더마릴리프 모이스처 폼클렌저) 일치"
-            if any(k in name_clean for k in ["리커버리", "밸런싱", "크림", "스킨"]):
-                return "더마 스킨케어", "✅ 정상매칭", "이미지(더마 스킨케어) 라인 일치"
-            return "미분류(확인필요)", "⚠️ 확인필요", "더마 라인 세부 카테고리 모호"
-
-        if any(k in name_clean for k in ["바디워시", "바디미스트", "바디로션", "바디"]):
-            if "바디로션" in name_clean:
-                return "바디케어", "⚠️ 확인필요", "바디케어 추정(이미지 외 품목: 바디로션)"
-            return "바디케어", "✅ 정상매칭", "이미지(바디케어) 라인 일치"
-
-        if any(k in name_clean for k in ["스팟패치", "진정패치", "패치"]):
-            if "토너패드" in name_clean or "시카패드" in name_clean or "올케어" in name_clean:
-                if "토너패드" in name_clean:
-                    return "스킨케어", "✅ 정상매칭", "이미지(스킨케어-3초진정 토너패드) 일치"
-                return "스킨케어", "⚠️ 확인필요", "스킨케어 패드 추정(이미지 외 품목)"
-            if "크림패치" in name_clean:
-                return "스킨케어", "✅ 정상매칭", "이미지(스킨케어-스팟클리어 크림패치) 일치"
-            if "화이트티트리" in name_clean:
-                return "스팟패치", "⚠️ 확인필요", "스팟패치 추정(이미지 외 신규 라인: 화이트 티트리)"
-            return "스팟패치", "✅ 정상매칭", "이미지(스팟패치) 라인 일치"
-
-        if any(
-            k in name_clean
-            for k in [
-                "세범밸런싱",
-                "모이스처플루이드",
-                "모이스처크림",
-                "토너패드",
-                "마스크",
-                "선크림",
-                "토너",
-                "스팟크림",
-            ]
-        ):
-            if "화이트티트리" in name_clean or "수딩마스크" in name_clean:
-                return "스킨케어", "⚠️ 확인필요", "스킨케어 추정(이미지 외 품목/리뉴얼명)"
-            return "스킨케어", "✅ 정상매칭", "이미지(스킨케어) 라인 일치"
-
-        if any(
-            k in name_clean
-            for k in [
-                "포밍워시",
-                "클렌저",
-                "크리미워시",
-                "클렌징오일",
-                "클렌징",
-                "포하",
-                "4ha",
-            ]
-        ):
-            if "화이트티트리" in name_clean:
-                return "클렌징", "⚠️ 확인필요", "클렌징 추정(이미지 외 신규 라인: 화이트 티트리)"
-            return "클렌징", "✅ 정상매칭", "이미지(클렌징) 라인 일치"
-
-        return "미분류(확인필요)", "⚠️ 확인필요", "포트폴리오 이미지 내 매칭 키워드 없음"
-
-    if brand == "Lipcare":
-        if "딥모이스트" in name_clean or "deepmoist" in name_clean:
-            return "딥 모이스트", "✅ 정상매칭", "이미지(딥 모이스트) 라인 일치"
-
-        if "메디케이티드" in name_clean or "medicated" in name_clean:
-            return "메디케이티드", "✅ 정상매칭", "이미지(메디케이티드) 라인 일치"
-
-        if "소프트립" in name_clean or "softlips" in name_clean:
-            return "소프트립스", "✅ 정상매칭", "이미지(소프트립스) 라인 일치"
-
-        if any(k in name_clean for k in ["매직컬러", "매직칼라", "틴티드컬러", "틴티드칼라"]):
-            return "매직컬러 / 틴티드컬러 라인", "✅ 정상매칭", "이미지(매직컬러/틴티드컬러) 일치"
-
-        if "립아이스" in name_clean or "lipice" in name_clean:
-            if any(k in name_clean for k in ["프루티", "레몬", "스트로베리", "딸기", "그레이프", "애플"]):
-                if "애플" in name_clean:
-                    return "립아이스 프루티", "⚠️ 확인필요", "립아이스 프루티 추정(이미지 외 향: 애플)"
-                return "립아이스 프루티", "✅ 정상매칭", "이미지(립아이스 프루티) 라인 일치"
-            return "립아이스 프루티", "⚠️ 확인필요", "립아이스 세부 라인 확인 필요"
-
-        return "미분류(확인필요)", "⚠️ 확인필요", "포트폴리오 이미지 외 라인(멜티크림/워터컬러/립퓨어 등)"
-
-    if brand == "HADALABO":
-        if "프리미엄" in name_clean or "premium" in name_clean:
-            return "Gokujyun premium (고쿠쥰 프리미엄)", "✅ 정상매칭", "이미지(Gokujyun premium) 일치"
-
-        if "시로쥰" in name_clean or "shirojyun" in name_clean:
-            return "Shirojyun (시로쥰)", "✅ 정상매칭", "이미지(Shirojyun) 일치"
-
-        if "키와미즈" in name_clean or "kiwamizu" in name_clean:
-            return "Kiwamizu (키와미즈)", "✅ 정상매칭", "이미지(Kiwamizu) 일치"
-
-        if "타마고하다" in name_clean or "tamagohada" in name_clean:
-            return "Tamagohada (타마고하다)", "✅ 정상매칭", "이미지(Tamagohada) 일치"
-
-        if "고쿠쥰" in name_clean or "gokujyun" in name_clean:
-            if "탄력" in name_clean:
-                return "Gokujyun (고쿠쥰)", "⚠️ 확인필요", "고쿠쥰 계열(탄력 라인: 이미지 외 세부라인)"
-            return "Gokujyun (고쿠쥰)", "✅ 정상매칭", "이미지(Gokujyun) 라인 일치"
-
-        return "미분류(확인필요)", "⚠️ 확인필요", "포트폴리오 이미지 외 라인(히아풀베리어 등)"
-
-    return "-", "해당없음", "기타 브랜드"
-
-
 def normalize_brand_name(val: str) -> str:
     s = str(val or "").strip()
     mapping = {
@@ -204,6 +119,7 @@ def normalize_brand_name(val: str) -> str:
         "Hadalabo": "HADALABO",
         "lipcare": "Lipcare",
         "LIPCARE": "Lipcare",
+        "다이소아크네스": "다이소-아크네스",
         "0": "미분류",
         "nan": "미분류",
         "": "미분류",
@@ -211,7 +127,7 @@ def normalize_brand_name(val: str) -> str:
     return mapping.get(s, s)
 
 
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def load_default_master(primary_path: str = DEFAULT_MASTER_FILE, fallback_path: str = FALLBACK_MASTER_FILE) -> pd.DataFrame:
     target_path = primary_path if os.path.exists(primary_path) else (fallback_path if os.path.exists(fallback_path) else None)
     if target_path is None:
@@ -229,7 +145,7 @@ def load_default_master(primary_path: str = DEFAULT_MASTER_FILE, fallback_path: 
     return df[["제품코드", "브랜드", "제품군"]]
 
 
-def _find_col_index(row1: list, row2: list, target_name: str, fallback_idx: int | None = None) -> int | None:
+def _find_col_index(row1: list, row2: list, target_name: str, fallback_idx: int) -> int:
     for idx, val in enumerate(row1):
         if val is not None and str(val).strip() == target_name:
             return idx
@@ -239,147 +155,385 @@ def _find_col_index(row1: list, row2: list, target_name: str, fallback_idx: int 
     return fallback_idx
 
 
-def _parse_warehouse_sheet(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def parse_warehouse_bytes(file_bytes: bytes, file_name: str) -> tuple[pd.DataFrame, dict]:
     """
-    물류창고에서 올려주는 '재고파일' 시트(1행 대분류/컬럼명, 2행 서브헤더 BOX/EA/환산, 3행~ 데이터)를
-    별도 수정 없이 그대로 읽어 표준 재고 테이블로 변환합니다.
+    업로드된 재고파일 바이트를 캐싱하여 클릭/수정 시 재파싱을 방지합니다.
+    물류창고 '재고파일' 시트를 그대로 읽고 '겔, 베르가못, 플라스타, 플라스마' 품목을 제외합니다.
     """
-    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
-    ws = wb[sheet_name]
-
-    row1 = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
-    row2 = [ws.cell(2, c).value for c in range(1, ws.max_column + 1)]
-
-    idx_seq = _find_col_index(row1, row2, "순번", 0)
-    idx_center = _find_col_index(row1, row2, "센터", 1)
-    idx_cell = _find_col_index(row1, row2, "셀", 2)
-    idx_prod = _find_col_index(row1, row2, "상품", 3)
-    idx_name = _find_col_index(row1, row2, "상품명", 4)
-    idx_lot = _find_col_index(row1, row2, "화주LOT", 6)
-    idx_exp = _find_col_index(row1, row2, "유효일자", 13)
-    idx_total = _find_col_index(row1, row2, "합계수량", 31)
-
-    # '정상수량'의 '환산' 컬럼 위치 탐색 (기본 index 27)
-    idx_norm_conv = 27
-    for idx, r1_val in enumerate(row1):
-        if r1_val is not None and "정상수량" in str(r1_val).strip():
-            for offset in range(0, 4):
-                c_pos = idx + offset
-                if c_pos < len(row2) and row2[c_pos] is not None and "환산" in str(row2[c_pos]).strip():
-                    idx_norm_conv = c_pos
-                    break
-            break
-
-    # '불량수량'의 '환산' 컬럼 위치 탐색 (기본 index 30)
-    idx_bad_conv = 30
-    for idx, r1_val in enumerate(row1):
-        if r1_val is not None and "불량수량" in str(r1_val).strip():
-            for offset in range(0, 4):
-                c_pos = idx + offset
-                if c_pos < len(row2) and row2[c_pos] is not None and "환산" in str(row2[c_pos]).strip():
-                    idx_bad_conv = c_pos
-                    break
-            break
-
-    # 2행이 서브헤더인지 판별하여 데이터 시작 행 결정
-    has_sub_header = any(
-        v is not None and str(v).strip() in {"BOX", "EA", "환산", "창고", "LOCATION"}
-        for v in row2
-    )
-    start_row = 3 if has_sub_header else 2
-
-    records = []
-    for r in range(start_row, ws.max_row + 1):
-        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
-        if all(v is None or str(v).strip() == "" for v in vals):
-            continue
-
-        seq_val = vals[idx_seq] if idx_seq is not None and idx_seq < len(vals) else None
-        prod_val = vals[idx_prod] if idx_prod is not None and idx_prod < len(vals) else None
-        if seq_val is None and (prod_val is None or str(prod_val).strip() == ""):
-            continue
-
-        prod_str = str(prod_val or "").strip()
-        if not prod_str or prod_str.lower() == "nan":
-            continue
-
-        center_str = str(vals[idx_center] or "-").strip() if idx_center is not None and idx_center < len(vals) else "-"
-        cell_str = str(vals[idx_cell] or "-").strip() if idx_cell is not None and idx_cell < len(vals) else "-"
-        name_str = str(vals[idx_name] or "").strip() if idx_name is not None and idx_name < len(vals) else ""
-        lot_str = str(vals[idx_lot] or "-").strip() if idx_lot is not None and idx_lot < len(vals) else "-"
-
-        exp_raw = vals[idx_exp] if idx_exp is not None and idx_exp < len(vals) else None
-        exp_parsed = pd.to_datetime(exp_raw, errors="coerce")
-        exp_str = exp_parsed.strftime("%Y-%m-%d") if pd.notna(exp_parsed) else (str(exp_raw).strip() if exp_raw not in (None, "") else "-")
-
-        norm_raw = vals[idx_norm_conv] if idx_norm_conv is not None and idx_norm_conv < len(vals) else 0
-        bad_raw = vals[idx_bad_conv] if idx_bad_conv is not None and idx_bad_conv < len(vals) else 0
-        tot_raw = vals[idx_total] if idx_total is not None and idx_total < len(vals) else None
-
-        norm_num = pd.to_numeric(norm_raw, errors="coerce")
-        bad_num = pd.to_numeric(bad_raw, errors="coerce")
-        tot_num = pd.to_numeric(tot_raw, errors="coerce")
-
-        norm_val = 0.0 if pd.isna(norm_num) else float(norm_num)
-        bad_val = 0.0 if pd.isna(bad_num) else float(bad_num)
-        tot_val = (norm_val + bad_val) if pd.isna(tot_num) else float(tot_num)
-
-        records.append(
-            {
-                "센터": center_str or "-",
-                "셀": cell_str or "-",
-                "상품": prod_str,
-                "상품명": name_str,
-                "화주LOT": lot_str or "-",
-                "유효일자": exp_str or "-",
-                "정상환산": norm_val,
-                "불량환산": bad_val,
-                "합계수량": tot_val,
-            }
-        )
-
-    out = pd.DataFrame(records)
-    if out.empty:
-        raise ValueError(f"'{sheet_name}' 시트에서 유효한 재고 행을 찾지 못했습니다.")
-    return out
-
-
-def parse_inventory_file(uploaded_file) -> tuple[pd.DataFrame, str]:
-    file_bytes = uploaded_file.getvalue()
-    fname = getattr(uploaded_file, "name", "").lower()
+    fname = (file_name or "").lower()
 
     if fname.endswith(".csv"):
         df = pd.read_csv(io.BytesIO(file_bytes))
         df.columns = [str(c).strip() for c in df.columns]
-        out = pd.DataFrame()
-        out["센터"] = df["센터"].fillna("-") if "센터" in df.columns else "-"
-        out["셀"] = df["셀"].fillna("-") if "셀" in df.columns else "-"
-        out["상품"] = df["상품"].astype(str).str.strip()
-        out["상품명"] = df["상품명"].astype(str).str.strip() if "상품명" in df.columns else ""
-        out["화주LOT"] = df["화주LOT"].fillna("-").astype(str) if "화주LOT" in df.columns else "-"
-        out["유효일자"] = df["유효일자"].fillna("-").astype(str) if "유효일자" in df.columns else "-"
         qty_col = "정상수량_환산" if "정상수량_환산" in df.columns else ("환산" if "환산" in df.columns else None)
-        out["정상환산"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0) if qty_col else 0
-        out["불량환산"] = pd.to_numeric(df["불량수량_환산"], errors="coerce").fillna(0) if "불량수량_환산" in df.columns else 0
-        out["합계수량"] = (
-            pd.to_numeric(df["합계수량"], errors="coerce").fillna(out["정상환산"] + out["불량환산"])
-            if "합계수량" in df.columns
-            else out["정상환산"] + out["불량환산"]
+        out = pd.DataFrame(
+            {
+                "센터": df["센터"].fillna("-").astype(str).str.strip() if "센터" in df.columns else "-",
+                "셀": df["셀"].fillna("-").astype(str).str.strip() if "셀" in df.columns else "-",
+                "상품": df["상품"].astype(str).str.strip() if "상품" in df.columns else "",
+                "상품명": df["상품명"].fillna("").astype(str).str.strip() if "상품명" in df.columns else "",
+                "화주LOT": df["화주LOT"].fillna("-").astype(str).str.strip() if "화주LOT" in df.columns else "-",
+                "유효일자_raw": df["유효일자"] if "유효일자" in df.columns else None,
+                "정상환산": pd.to_numeric(df[qty_col], errors="coerce").fillna(0.0) if qty_col else 0.0,
+                "불량환산": pd.to_numeric(df["불량수량_환산"], errors="coerce").fillna(0.0) if "불량수량_환산" in df.columns else 0.0,
+                "합계수량_raw": pd.to_numeric(df["합계수량"], errors="coerce") if "합계수량" in df.columns else None,
+            }
         )
-        out = out[out["상품"].notna() & (out["상품"] != "") & (out["상품"] != "nan")].copy()
-        return out, "CSV 재고파일 로드 완료"
+        raw_total_rows = len(out)
+        source_label = "CSV 재고파일"
+    else:
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+        sheet_names = wb.sheetnames
+        sheet_name = "재고파일" if "재고파일" in sheet_names else ("sheet1" if "sheet1" in sheet_names else sheet_names[0])
+        ws = wb[sheet_name]
+        rows = list(ws.iter_rows(values_only=True))
+        wb.close()
 
-    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
-    sheet_names = wb.sheetnames
-    wb.close()
+        if len(rows) < 2:
+            raise ValueError(f"'{sheet_name}' 시트에 데이터가 없습니다.")
 
-    if "재고파일" in sheet_names:
-        return _parse_warehouse_sheet(file_bytes, "재고파일"), "물류창고 '재고파일' 시트 그대로 로드 완료"
+        row1 = rows[0]
+        row2 = rows[1]
 
-    if "sheet1" in sheet_names:
-        return _parse_warehouse_sheet(file_bytes, "sheet1"), "물류창고 'sheet1' 시트 그대로 로드 완료"
+        idx_seq = _find_col_index(row1, row2, "순번", 0)
+        idx_center = _find_col_index(row1, row2, "센터", 1)
+        idx_cell = _find_col_index(row1, row2, "셀", 2)
+        idx_prod = _find_col_index(row1, row2, "상품", 3)
+        idx_name = _find_col_index(row1, row2, "상품명", 4)
+        idx_lot = _find_col_index(row1, row2, "화주LOT", 6)
+        idx_exp = _find_col_index(row1, row2, "유효일자", 13)
+        idx_total = _find_col_index(row1, row2, "합계수량", 31)
 
-    return _parse_warehouse_sheet(file_bytes, sheet_names[0]), f"재고파일('{sheet_names[0]}' 시트) 그대로 로드 완료"
+        idx_norm_conv = 27
+        for idx, r1_val in enumerate(row1):
+            if r1_val is not None and "정상수량" in str(r1_val).strip():
+                for off in range(4):
+                    c_pos = idx + off
+                    if c_pos < len(row2) and row2[c_pos] is not None and "환산" in str(row2[c_pos]).strip():
+                        idx_norm_conv = c_pos
+                        break
+                break
+
+        idx_bad_conv = 30
+        for idx, r1_val in enumerate(row1):
+            if r1_val is not None and "불량수량" in str(r1_val).strip():
+                for off in range(4):
+                    c_pos = idx + off
+                    if c_pos < len(row2) and row2[c_pos] is not None and "환산" in str(row2[c_pos]).strip():
+                        idx_bad_conv = c_pos
+                        break
+                break
+
+        has_sub_header = any(
+            v is not None and str(v).strip() in {"BOX", "EA", "환산", "창고", "LOCATION"}
+            for v in row2
+        )
+        start_idx = 2 if has_sub_header else 1
+
+        records = []
+        for r in rows[start_idx:]:
+            if not r:
+                continue
+            seq_v = r[idx_seq] if idx_seq < len(r) else None
+            prod_v = r[idx_prod] if idx_prod < len(r) else None
+            if seq_v is None and (prod_v is None or str(prod_v).strip() == ""):
+                continue
+            p_str = str(prod_v or "").strip()
+            if not p_str or p_str.lower() == "nan":
+                continue
+
+            records.append(
+                {
+                    "센터": str(r[idx_center] or "-").strip() if idx_center < len(r) else "-",
+                    "셀": str(r[idx_cell] or "-").strip() if idx_cell < len(r) else "-",
+                    "상품": p_str,
+                    "상품명": str(r[idx_name] or "").strip() if idx_name < len(r) else "",
+                    "화주LOT": str(r[idx_lot] or "-").strip() if idx_lot < len(r) else "-",
+                    "유효일자_raw": r[idx_exp] if idx_exp < len(r) else None,
+                    "정상환산": r[idx_norm_conv] if idx_norm_conv < len(r) else 0,
+                    "불량환산": r[idx_bad_conv] if idx_bad_conv < len(r) else 0,
+                    "합계수량_raw": r[idx_total] if idx_total < len(r) else None,
+                }
+            )
+
+        out = pd.DataFrame(records)
+        raw_total_rows = len(out)
+        source_label = f"물류창고 '{sheet_name}' 시트"
+
+    if out.empty:
+        raise ValueError("업로드 파일에서 유효한 재고 데이터를 찾지 못했습니다.")
+
+    out = out[out["상품"].notna() & (out["상품"] != "") & (out["상품"].str.lower() != "nan")].copy()
+    out["센터"] = out["센터"].replace({"": "-", "nan": "-", "None": "-"})
+    out["셀"] = out["셀"].replace({"": "-", "nan": "-", "None": "-"})
+    out["화주LOT"] = out["화주LOT"].replace({"": "-", "nan": "-", "None": "-"})
+
+    out["정상환산"] = pd.to_numeric(out["정상환산"], errors="coerce").fillna(0.0)
+    out["불량환산"] = pd.to_numeric(out["불량환산"], errors="coerce").fillna(0.0)
+    tot_num = pd.to_numeric(out["합계수량_raw"], errors="coerce")
+    out["합계수량"] = tot_num.fillna(out["정상환산"] + out["불량환산"])
+
+    exp_dt = pd.to_datetime(out["유효일자_raw"], errors="coerce")
+    raw_exp_str = out["유효일자_raw"].astype(str).str.strip().replace({"None": "-", "nan": "-", "NaT": "-", "": "-"})
+    out["유효일자"] = exp_dt.dt.strftime("%Y-%m-%d").fillna(raw_exp_str)
+
+    # 겔, 베르가못, 플라스타, 플라스마 제외
+    excl_pattern = "|".join(re.escape(k) for k in EXCLUDED_KEYWORDS)
+    excl_mask = out["상품명"].str.contains(excl_pattern, case=False, na=False)
+    excluded_rows = int(excl_mask.sum())
+    excluded_qty = float(out.loc[excl_mask, "합계수량"].sum())
+
+    filtered = out[~excl_mask].drop(columns=["유효일자_raw", "합계수량_raw"]).reset_index(drop=True)
+
+    meta = {
+        "source_label": source_label,
+        "raw_total_rows": raw_total_rows,
+        "excluded_rows": excluded_rows,
+        "excluded_qty": excluded_qty,
+        "final_rows": len(filtered),
+        "unique_skus": int(filtered["상품"].nunique()),
+    }
+    return filtered, meta
+
+
+@st.cache_data(show_spinner=False)
+def parse_outbound_bytes(file_bytes: bytes, file_name: str) -> tuple[pd.DataFrame, dict]:
+    """
+    '일일출고 현황' 파일을 유연하게 파싱하여 상품코드별 일평균 출고량, 출고일수, 일자별 추이를 산출합니다.
+    """
+    fname = (file_name or "").lower()
+    if fname.endswith(".csv"):
+        raw_df = pd.read_csv(io.BytesIO(file_bytes))
+    else:
+        xls = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
+        sheet = xls.sheet_names[0]
+        preview = pd.read_excel(xls, sheet_name=sheet, header=None, nrows=8)
+        header_row = 0
+        code_tokens = {"상품코드", "제품코드", "품목코드", "상품", "제품", "품목"}
+        qty_tokens = {"출고수량", "출고", "수량", "환산", "수주량", "합계", "출고량"}
+        for r_idx in range(len(preview)):
+            vals = {str(v).strip() for v in preview.iloc[r_idx].tolist() if pd.notna(v)}
+            if vals & code_tokens and (vals & qty_tokens or any("수량" in x or "출고" in x for x in vals)):
+                header_row = r_idx
+                break
+        raw_df = pd.read_excel(xls, sheet_name=sheet, header=header_row)
+
+    df = raw_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    code_col = next(
+        (c for c in df.columns if c in {"상품코드", "제품코드", "품목코드", "상품", "제품", "품목", "SKU", "sku"}),
+        None,
+    )
+    if code_col is None:
+        code_col = next((c for c in df.columns if "코드" in c or "상품" in c or "품목" in c), df.columns[0])
+
+    name_col = next((c for c in df.columns if c in {"상품명", "제품명", "품목명"}), None)
+    if name_col is None:
+        name_col = next((c for c in df.columns if "명" in c and "출고" not in c), None)
+
+    date_col = next(
+        (c for c in df.columns if any(k in c for k in ["출고일", "일자", "날짜", "DATE", "date"])),
+        None,
+    )
+
+    qty_col = next(
+        (
+            c
+            for c in df.columns
+            if any(k in c for k in ["출고수량", "출고량", "환산", "수주", "출고"])
+            and "일자" not in c
+            and "날짜" not in c
+            and "코드" not in c
+        ),
+        None,
+    )
+    if qty_col is None:
+        num_cols = [c for c in df.columns if c != code_col and pd.api.types.is_numeric_dtype(df[c])]
+        qty_col = num_cols[0] if num_cols else df.columns[-1]
+
+    cleaned = pd.DataFrame(
+        {
+            "상품": df[code_col].astype(str).str.strip(),
+            "출고_상품명": df[name_col].fillna("").astype(str).str.strip() if name_col else "",
+            "출고수량": pd.to_numeric(df[qty_col], errors="coerce").fillna(0.0),
+        }
+    )
+    cleaned = cleaned[
+        cleaned["상품"].notna()
+        & (cleaned["상품"] != "")
+        & (cleaned["상품"].str.lower() != "nan")
+        & (~cleaned["상품"].isin(["상품코드", "제품코드", "품목코드", "상품", "합계", "총계"]))
+    ].copy()
+
+    if date_col:
+        dt_s = pd.to_datetime(df.loc[cleaned.index, date_col], errors="coerce")
+        cleaned["출고일자"] = dt_s
+        unique_days = int(dt_s.dropna().nunique())
+        if unique_days <= 0:
+            unique_days = 1
+        min_dt = dt_s.min()
+        max_dt = dt_s.max()
+        span_days = int((max_dt - min_dt).days) + 1 if pd.notna(min_dt) and pd.notna(max_dt) else unique_days
+        denom_days = max(unique_days, min(span_days, 365))
+    else:
+        cleaned["출고일자"] = pd.NaT
+        unique_days = 1
+        denom_days = 30
+
+    # 겔, 베르가못, 플라스타, 플라스마 제외
+    excl_pattern = "|".join(re.escape(k) for k in EXCLUDED_KEYWORDS)
+    cleaned = cleaned[~cleaned["출고_상품명"].str.contains(excl_pattern, case=False, na=False)].copy()
+
+    sku_outbound = (
+        cleaned.groupby("상품", as_index=False)
+        .agg(
+            누적_출고수량=("출고수량", "sum"),
+            출고_발생일수=("출고일자", lambda s: int(s.dropna().nunique()) if s.notna().any() else 1),
+        )
+    )
+    sku_outbound["출고_발생일수"] = sku_outbound["출고_발생일수"].clip(lower=1)
+    # 일평균 출고량은 전체 기간(denom_days) 기준 및 발생일수 기준 중 보수적(실제 일평균 수요 반영) 산출
+    sku_outbound["일평균_출고량"] = (sku_outbound["누적_출고수량"] / float(denom_days)).round(2)
+    sku_outbound["월예상_출고량"] = (sku_outbound["일평균_출고량"] * 30.0).round(0)
+
+    info = {
+        "rows": len(cleaned),
+        "unique_skus": int(sku_outbound["상품"].nunique()),
+        "total_outbound": float(cleaned["출고수량"].sum()),
+        "denom_days": denom_days,
+        "unique_days": unique_days,
+        "date_col": date_col or "일자열 없음(월30일 기준 환산)",
+        "qty_col": qty_col,
+    }
+    return sku_outbound, info
+
+
+@st.cache_data(show_spinner=False)
+def classify_skus_cached(
+    unique_sku_df: pd.DataFrame,
+    master_records: tuple[tuple[str, str], ...],
+    brand_overrides_tuple: tuple[tuple[str, str], ...],
+    port_overrides_tuple: tuple[tuple[str, str], ...],
+) -> pd.DataFrame:
+    master_map = dict(master_records)
+    brand_ov = dict(brand_overrides_tuple)
+    port_ov = dict(port_overrides_tuple)
+
+    brands = []
+    auto_ports = []
+    final_ports = []
+    statuses = []
+    reasons = []
+
+    for row in unique_sku_df.itertuples(index=False):
+        code = str(row.상품 or "").strip()
+        name = str(row.상품명 or "").strip()
+        name_clean = re.sub(r"\s+", "", name).lower()
+
+        if code in brand_ov:
+            b = brand_ov[code]
+        elif code in DAISO_ACNES_CODES or ("아크네스화이트티트리" in name_clean and "다이소" in name_clean):
+            b = "다이소-아크네스"
+        else:
+            m_brand = normalize_brand_name(master_map.get(code, "미분류"))
+            if m_brand in ("미분류", "부자재", "사은품"):
+                if "아크네스" in name_clean or "acnes" in name_clean:
+                    b = "Acnes"
+                elif "립" in name_clean or "lip" in name_clean:
+                    b = "Lipcare"
+                elif "하다라보" in name_clean or "hadalabo" in name_clean:
+                    b = "HADALABO"
+                else:
+                    b = m_brand
+            else:
+                b = m_brand
+
+        if b == "다이소-아크네스":
+            if any(k in name_clean for k in ["패치", "스팟패치"]):
+                ap, st_val, rsn = "스팟패치", "✅ 정상매칭", "첨부1 이미지(다이소-아크네스 스팟패치) 일치"
+            elif any(k in name_clean for k in ["클렌저", "포밍워시", "워시", "폼"]):
+                ap, st_val, rsn = "클렌징", "✅ 정상매칭", "첨부1 이미지(다이소-아크네스 클렌징) 일치"
+            elif any(k in name_clean for k in ["크림", "토너", "스킨"]):
+                ap, st_val, rsn = "스킨케어", "✅ 정상매칭", "첨부1 이미지(다이소-아크네스 스킨케어) 일치"
+            else:
+                ap, st_val, rsn = "미분류(확인필요)", "⚠️ 확인필요", "다이소-아크네스 세부라인 확인 필요"
+        elif b == "Acnes":
+            if "포맨" in name_clean or "formen" in name_clean:
+                ap, st_val, rsn = "포 맨", "✅ 정상매칭", "Acnes 포맨 라인 일치"
+            elif "더마릴리프" in name_clean or "더마" in name_clean:
+                if any(k in name_clean for k in ["클렌저", "워시", "폼"]):
+                    ap, st_val, rsn = "클렌징", "✅ 정상매칭", "Acnes 더마 클렌징 라인 일치"
+                elif any(k in name_clean for k in ["리커버리", "밸런싱", "크림", "스킨"]):
+                    ap, st_val, rsn = "더마 스킨케어", "✅ 정상매칭", "Acnes 더마 스킨케어 라인 일치"
+                else:
+                    ap, st_val, rsn = "미분류(확인필요)", "⚠️ 확인필요", "더마 세부 카테고리 모호"
+            elif any(k in name_clean for k in ["바디워시", "바디미스트", "바디로션", "바디"]):
+                ap, st_val, rsn = "바디케어", "✅ 정상매칭" if "바디로션" not in name_clean else "⚠️ 확인필요", "Acnes 바디케어 라인"
+            elif any(k in name_clean for k in ["스팟패치", "진정패치", "패치"]):
+                if "토너패드" in name_clean:
+                    ap, st_val, rsn = "스킨케어", "✅ 정상매칭", "Acnes 스킨케어 토너패드 일치"
+                elif "크림패치" in name_clean:
+                    ap, st_val, rsn = "스킨케어", "⚠️ 확인필요", "스킨케어 패드 추정(크림패치)"
+                elif "화이트티트리" in name_clean:
+                    ap, st_val, rsn = "스팟패치", "⚠️ 확인필요", "화이트 티트리 스팟패치 추정"
+                else:
+                    ap, st_val, rsn = "스팟패치", "✅ 정상매칭", "Acnes 스팟패치 라인 일치"
+            elif any(k in name_clean for k in ["세범밸런싱", "모이스처플루이드", "모이스처크림", "토너패드", "마스크", "선크림", "토너", "스팟크림"]):
+                ap, st_val, rsn = "스킨케어", "⚠️ 확인필요" if ("화이트티트리" in name_clean or "수딩마스크" in name_clean) else "✅ 정상매칭", "Acnes 스킨케어 라인"
+            elif any(k in name_clean for k in ["포밍워시", "클렌저", "크리미워시", "클렌징오일", "클렌징", "포하", "4ha"]):
+                ap, st_val, rsn = "클렌징", "⚠️ 확인필요" if "화이트티트리" in name_clean else "✅ 정상매칭", "Acnes 클렌징 라인"
+            else:
+                ap, st_val, rsn = "미분류(확인필요)", "⚠️ 확인필요", "Acnes 포트폴리오 키워드 미일치"
+        elif b == "Lipcare":
+            if "딥모이스트" in name_clean or "deepmoist" in name_clean:
+                ap, st_val, rsn = "딥 모이스트", "✅ 정상매칭", "Lipcare 딥 모이스트 라인 일치"
+            elif "메디케이티드" in name_clean or "medicated" in name_clean:
+                ap, st_val, rsn = "메디케이티드", "✅ 정상매칭", "Lipcare 메디케이티드 라인 일치"
+            elif "소프트립" in name_clean or "softlips" in name_clean:
+                ap, st_val, rsn = "소프트립스", "✅ 정상매칭", "Lipcare 소프트립스 라인 일치"
+            elif any(k in name_clean for k in ["매직컬러", "매직칼라", "틴티드컬러", "틴티드칼라"]):
+                ap, st_val, rsn = "매직컬러 / 틴티드컬러 라인", "✅ 정상매칭", "Lipcare 매직/틴티드 컬러 일치"
+            elif "립아이스" in name_clean or "lipice" in name_clean:
+                ap, st_val, rsn = "립아이스 프루티", "✅ 정상매칭" if any(k in name_clean for k in ["프루티", "레몬", "스트로베리", "딸기", "그레이프"]) else "⚠️ 확인필요", "립아이스 프루티 라인"
+            else:
+                ap, st_val, rsn = "미분류(확인필요)", "⚠️ 확인필요", "Lipcare 세부 라인 확인 필요"
+        elif b == "HADALABO":
+            if "프리미엄" in name_clean or "premium" in name_clean:
+                ap, st_val, rsn = "Gokujyun premium (고쿠쥰 프리미엄)", "✅ 정상매칭", "HADALABO 고쿠쥰 프리미엄 일치"
+            elif "시로쥰" in name_clean or "shirojyun" in name_clean:
+                ap, st_val, rsn = "Shirojyun (시로쥰)", "✅ 정상매칭", "HADALABO 시로쥰 일치"
+            elif "키와미즈" in name_clean or "kiwamizu" in name_clean:
+                ap, st_val, rsn = "Kiwamizu (키와미즈)", "✅ 정상매칭", "HADALABO 키와미즈 일치"
+            elif "타마고하다" in name_clean or "tamagohada" in name_clean:
+                ap, st_val, rsn = "Tamagohada (타마고하다)", "✅ 정상매칭", "HADALABO 타마고하다 일치"
+            elif "고쿠쥰" in name_clean or "gokujyun" in name_clean:
+                ap, st_val, rsn = "Gokujyun (고쿠쥰)", "⚠️ 확인필요" if "탄력" in name_clean else "✅ 정상매칭", "HADALABO 고쿠쥰 라인"
+            else:
+                ap, st_val, rsn = "미분류(확인필요)", "⚠️ 확인필요", "HADALABO 세부 라인 확인 필요"
+        else:
+            ap, st_val, rsn = "-", "해당없음", "기타/미분류 브랜드"
+
+        if code in port_ov:
+            fp = port_ov[code]
+            st_val = "✏️ 사용자수정완료"
+        else:
+            fp = ap
+
+        brands.append(b)
+        auto_ports.append(ap)
+        final_ports.append(fp)
+        statuses.append(st_val)
+        reasons.append(rsn)
+
+    res = unique_sku_df[["상품", "상품명"]].copy()
+    res["브랜드"] = brands
+    res["자동_포트폴리오"] = auto_ports
+    res["최종_포트폴리오"] = final_ports
+    res["검수상태"] = statuses
+    res["판별근거"] = reasons
+    return res
 
 
 def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
@@ -389,277 +543,617 @@ def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
     return buf.getvalue()
 
 
+def get_template_bytes() -> bytes:
+    if os.path.exists(NEW_SKU_TEMPLATE_FILE):
+        with open(NEW_SKU_TEMPLATE_FILE, "rb") as f:
+            return f.read()
+    cols = ["제품코드", "브랜드", "제품명(제품군)", "포트폴리오", "입수량(BOX)", "수입리드타임(일)", "안전재고일수(일)", "비고(채널/규격/특이사항)"]
+    sample = [["ME00999NEW", "다이소-아크네스", "아크네스 화이트 티트리 시카 세럼 30mL (다이소)", "스킨케어", 24, 90, 30, "수입 리드타임 반영"]]
+    return to_excel_bytes(pd.DataFrame(sample, columns=cols), sheet_name="신규제품_등록")
+
+
+# 세션 상태 초기화
 if "master_df" not in st.session_state:
     st.session_state["master_df"] = load_default_master()
-
+if "custom_skus" not in st.session_state:
+    st.session_state["custom_skus"] = {}  # code -> dict(상품명, 브랜드, 포트폴리오, 리드타임, 안전재고일수, 비고)
+if "brand_overrides" not in st.session_state:
+    st.session_state["brand_overrides"] = {}
 if "portfolio_overrides" not in st.session_state:
     st.session_state["portfolio_overrides"] = {}
-
 if "selected_brand" not in st.session_state:
-    st.session_state["selected_brand"] = "Acnes"
+    st.session_state["selected_brand"] = "다이소-아크네스"
+if "active_tab" not in st.session_state:
+    st.session_state["active_tab"] = "📊 브랜드·포트폴리오 현황"
+if "selected_forecast_sku" not in st.session_state:
+    st.session_state["selected_forecast_sku"] = ""
 
-st.title("📦 브랜드 및 포트폴리오별 통합 재고 현황 대시보드")
-st.caption("물류창고에서 올려주는 재고파일('재고파일.xlsx')을 별도 가공 없이 그대로 업로드하여 브랜드·포트폴리오별 재고를 실시간 분석합니다.")
+# 4번 & 5번 사항: 페이지 상단 좌측 타이틀 + 우측 상단 '신규 제품코드 즉시 추가' 및 양식 다운로드
+top_l, top_r = st.columns([1.35, 1.15])
+with top_l:
+    st.title("📦 브랜드 및 포트폴리오별 통합 재고 현황")
+    st.caption("제외 품목(겔·베르가못·플라스타·플라스마) 자동 제외 · 브랜드/포트폴리오 · 수입리드타임 기반 DOH·안전재고 팔로우업")
 
-with st.container(border=True):
-    uploaded_inv = st.file_uploader(
-        "📂 물류창고 재고파일 그대로 업로드 ('재고파일' 시트 양식)",
-        type=["xlsx", "csv"],
-        help="물류창고에서 내려받은 원본 재고파일('재고파일' 시트)을 수정 없이 그대로 올려주세요.",
-    )
+with top_r:
+    with st.container(border=True):
+        hdr_c1, hdr_c2 = st.columns([1.4, 1.0])
+        with hdr_c1:
+            st.markdown("**➕ 신규 제품코드 즉시 등록**")
+        with hdr_c2:
+            st.download_button(
+                label="📄 신규등록 양식(.xlsx)",
+                data=get_template_bytes(),
+                file_name=NEW_SKU_TEMPLATE_FILE,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+        with st.form("quick_new_sku_form", clear_on_submit=True):
+            f_c1, f_c2, f_c3 = st.columns([1.1, 1.1, 1.3])
+            with f_c1:
+                new_code = st.text_input("제품코드*", placeholder="예: ME00999NEW")
+            with f_c2:
+                new_brand = st.selectbox("브랜드*", options=BRAND_CHOICES, index=0)
+            with f_c3:
+                new_name = st.text_input("제품명(제품군)", placeholder="예: 아크네스 화이트 티트리 세럼")
+
+            f_c4, f_c5, f_c6 = st.columns([1.1, 1.0, 1.1])
+            with f_c4:
+                p_opts = PORTFOLIO_OPTIONS.get(new_brand, ["기본"])
+                new_port = st.selectbox("포트폴리오", options=p_opts)
+            with f_c5:
+                new_lt = st.number_input("수입LT(일)", min_value=1, max_value=365, value=90, step=5)
+            with f_c6:
+                st.write("")
+                submitted_new = st.form_submit_button("⚡ 즉시 연동", type="primary", use_container_width=True)
+
+            if submitted_new:
+                clean_c = str(new_code or "").strip()
+                if not clean_c:
+                    st.error("제품코드를 입력해주세요.")
+                else:
+                    clean_nm = str(new_name or "").strip() or f"신규등록품목 ({clean_c})"
+                    st.session_state["custom_skus"][clean_c] = {
+                        "상품명": clean_nm,
+                        "브랜드": new_brand,
+                        "포트폴리오": new_port,
+                        "수입LT": int(new_lt),
+                    }
+                    st.session_state["brand_overrides"][clean_c] = new_brand
+                    st.session_state["portfolio_overrides"][clean_c] = new_port
+                    st.session_state["selected_forecast_sku"] = clean_c
+                    st.success(f"신규 제품코드 '{clean_c}' ({new_brand})가 즉시 연동되었습니다.")
+                    st.rerun()
+
+# 파일 업로더 영역 (재고파일 + 일일출고 현황)
+up_c1, up_c2 = st.columns(2)
+with up_c1:
+    with st.container(border=True):
+        uploaded_inv = st.file_uploader(
+            "📂 1. 물류창고 재고파일 업로드 ('재고파일' 시트 양식)",
+            type=["xlsx", "csv"],
+            key="uploader_inv_main",
+        )
+with up_c2:
+    with st.container(border=True):
+        uploaded_out = st.file_uploader(
+            "🚚 2. '일일출고 현황' 파일 업로드 (DOH·안전재고·월별 예상출고 연동)",
+            type=["xlsx", "xls", "csv"],
+            key="uploader_outbound_main",
+        )
 
 if uploaded_inv is None:
-    st.info("👆 물류창고에서 내려받은 재고파일을 그대로 업로드하면 브랜드별 재고 막대그래프와 포트폴리오 분석이 즉시 실행됩니다.")
+    st.info("👆 물류창고 재고파일을 업로드하면 재고 및 SCM 분석이 시작됩니다. (신규 등록 코드는 우측 상단에서 바로 관리 가능)")
     st.stop()
 
 try:
-    inv_df, load_msg = parse_inventory_file(uploaded_inv)
-    st.success(f"✅ {load_msg} (총 {len(inv_df):,}건 / 고유 품목 {inv_df['상품'].nunique():,}종)")
+    inv_df, meta = parse_warehouse_bytes(uploaded_inv.getvalue(), uploaded_inv.name)
 except Exception as e:
-    st.error(f"❌ 파일 형식 오류: {e}")
+    st.error(f"❌ 재고파일 파싱 오류: {e}")
     st.stop()
 
-master_df = st.session_state["master_df"].copy()
-master_codes = set(master_df["제품코드"].unique())
-inv_unique_items = inv_df[["상품", "상품명"]].drop_duplicates(subset=["상품"])
+# 신규 등록된 SKU 중 재고파일에 아직 없는 코드도 가상 행으로 합쳐 즉시 연동
+if st.session_state["custom_skus"]:
+    existing_codes = set(inv_df["상품"].unique())
+    extra_rows = []
+    for c_code, c_info in st.session_state["custom_skus"].items():
+        if c_code not in existing_codes:
+            extra_rows.append(
+                {
+                    "센터": "신규등록(대기)",
+                    "셀": "-",
+                    "상품": c_code,
+                    "상품명": c_info.get("상품명", c_code),
+                    "화주LOT": "-",
+                    "유효일자": "-",
+                    "정상환산": 0.0,
+                    "불량환산": 0.0,
+                    "합계수량": 0.0,
+                }
+            )
+    if extra_rows:
+        inv_df = pd.concat([inv_df, pd.DataFrame(extra_rows)], ignore_index=True)
 
-new_items = inv_unique_items[~inv_unique_items["상품"].isin(master_codes)].copy()
-if not new_items.empty:
-    new_rows = pd.DataFrame(
-        {
-            "제품코드": new_items["상품"],
-            "브랜드": "미분류",
-            "제품군": new_items["상품명"],
-        }
+# 일일출고 현황 파싱(업로드된 경우)
+outbound_df = None
+outbound_info = None
+if uploaded_out is not None:
+    try:
+        outbound_df, outbound_info = parse_outbound_bytes(uploaded_out.getvalue(), uploaded_out.name)
+    except Exception as e:
+        st.warning(f"⚠️ '일일출고 현황' 파일 파싱 중 참고사항: {e}")
+
+st.success(
+    f"✅ {meta['source_label']} 로드 완료 | 전체 {meta['raw_total_rows']:,}건 중 제외({', '.join(EXCLUDED_KEYWORDS)}) {meta['excluded_rows']:,}건 "
+    f"({int(meta['excluded_qty']):,} EA) 반영 → **분석 대상 {meta['final_rows']:,}건 (고유 SKU {meta['unique_skus']:,}종)**"
+    + (
+        f" | 🚚 일일출고 {outbound_info['rows']:,}건 ({outbound_info['unique_skus']:,} SKU, 기준 {outbound_info['denom_days']}일) 연동됨"
+        if outbound_info
+        else " | 💡 '일일출고 현황'을 올리면 실출고 기반 DOH·안전재고·월별 예상출고가 정밀 산출됩니다."
     )
-    master_df = pd.concat([new_rows, master_df], ignore_index=True).drop_duplicates(subset=["제품코드"])
-    st.session_state["master_df"] = master_df
-
-active_master = master_df[master_df["제품코드"].isin(inv_unique_items["상품"])].copy()
-active_master = active_master.sort_values(by=["브랜드", "제품코드"]).reset_index(drop=True)
-
-unassigned_count = (active_master["브랜드"] == "미분류").sum()
-
-with st.expander(
-    f"🛠️ 코드별 브랜드 매핑 수정 (재고 보유 품목 {len(active_master)}종 | 미분류 {unassigned_count}종)",
-    expanded=(unassigned_count > 0),
-):
-    st.markdown(
-        "재고 파일에 포함된 **제품코드별 브랜드**를 아래 표에서 직접 수정할 수 있습니다. "
-        "수정 즉시 그래프와 하단 내역에 자동 반영됩니다."
-    )
-    m_col1, m_col2 = st.columns([2, 1])
-    with m_col1:
-        search_master = st.text_input("🔍 제품코드 또는 제품명 검색", placeholder="예: ME00621, 아크네스, 립아이스...")
-    with m_col2:
-        only_unassigned = st.checkbox("미분류 코드만 보기", value=False)
-
-    edit_target = active_master.copy()
-    if search_master:
-        mask = edit_target["제품코드"].str.contains(search_master, case=False, na=False) | edit_target[
-            "제품군"
-        ].str.contains(search_master, case=False, na=False)
-        edit_target = edit_target[mask]
-    if only_unassigned:
-        edit_target = edit_target[edit_target["브랜드"] == "미분류"]
-
-    edited_master = st.data_editor(
-        edit_target,
-        column_config={
-            "제품코드": st.column_config.TextColumn("제품코드", disabled=True),
-            "브랜드": st.column_config.SelectboxColumn("브랜드 (클릭하여 수정)", options=BRAND_CHOICES, required=True),
-            "제품군": st.column_config.TextColumn("제품군(품목명)", disabled=True),
-        },
-        use_container_width=True,
-        hide_index=True,
-        height=280,
-        key="brand_master_editor",
-    )
-
-    if not edited_master.equals(edit_target):
-        update_map = dict(zip(edited_master["제품코드"], edited_master["브랜드"]))
-        st.session_state["master_df"]["브랜드"] = st.session_state["master_df"].apply(
-            lambda r: update_map.get(r["제품코드"], r["브랜드"]), axis=1
-        )
-        st.rerun()
-
-    st.download_button(
-        label="💾 수정된 '브랜드_제품코드_마스터.xlsx' 다운로드",
-        data=to_excel_bytes(st.session_state["master_df"], sheet_name="Sheet1"),
-        file_name=DEFAULT_MASTER_FILE,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-brand_map = dict(zip(st.session_state["master_df"]["제품코드"], st.session_state["master_df"]["브랜드"]))
-inv_df["브랜드"] = inv_df["상품"].map(brand_map).fillna("미분류")
-
-unique_prod = inv_df[["상품", "상품명", "브랜드"]].drop_duplicates(subset=["상품"]).copy()
-port_results = unique_prod.apply(lambda r: classify_portfolio(r["브랜드"], r["상품명"]), axis=1)
-unique_prod["자동_포트폴리오"] = [x[0] for x in port_results]
-unique_prod["검수상태"] = [x[1] for x in port_results]
-unique_prod["판별근거"] = [x[2] for x in port_results]
-
-overrides = st.session_state["portfolio_overrides"]
-unique_prod["최종_포트폴리오"] = unique_prod.apply(
-    lambda r: overrides.get(r["상품"], r["자동_포트폴리오"]), axis=1
 )
-unique_prod["검수상태"] = unique_prod.apply(
-    lambda r: "✏️ 사용자수정완료" if r["상품"] in overrides else r["검수상태"], axis=1
+
+# 마스터 병합 및 SKU 단위 분류 캐싱
+master_df = st.session_state["master_df"]
+master_map = dict(zip(master_df["제품코드"], master_df["브랜드"]))
+for k_code, k_val in st.session_state["custom_skus"].items():
+    master_map[k_code] = k_val.get("브랜드", "미분류")
+
+unique_sku_df = inv_df[["상품", "상품명"]].drop_duplicates(subset=["상품"]).reset_index(drop=True)
+for k_code, k_val in st.session_state["custom_skus"].items():
+    mask_c = unique_sku_df["상품"] == k_code
+    if mask_c.any() and k_val.get("상품명"):
+        unique_sku_df.loc[mask_c, "상품명"] = k_val["상품명"]
+
+master_records_tuple = tuple(sorted(master_map.items()))
+brand_ov_tuple = tuple(sorted(st.session_state["brand_overrides"].items()))
+port_ov_tuple = tuple(sorted(st.session_state["portfolio_overrides"].items()))
+
+sku_classified = classify_skus_cached(
+    unique_sku_df,
+    master_records_tuple,
+    brand_ov_tuple,
+    port_ov_tuple,
 )
 
 inv_merged = inv_df.merge(
-    unique_prod[["상품", "최종_포트폴리오", "검수상태", "판별근거"]],
+    sku_classified[["상품", "브랜드", "최종_포트폴리오", "검수상태", "판별근거"]],
     on="상품",
     how="left",
 )
+inv_merged["브랜드"] = inv_merged["브랜드"].fillna("미분류")
+inv_merged["최종_포트폴리오"] = inv_merged["최종_포트폴리오"].fillna("-")
+inv_merged["검수상태"] = inv_merged["검수상태"].fillna("해당없음")
 
-st.markdown('<div class="section-title">📊 브랜드별 전체 재고 현황</div>', unsafe_allow_html=True)
-
-ctrl_c1, ctrl_c2 = st.columns([2, 3])
-with ctrl_c1:
-    qty_metric = st.radio(
-        "수량 기준 선택",
-        options=["정상환산", "합계수량", "불량환산"],
-        format_func=lambda x: {"정상환산": "정상재고 (환산 EA)", "합계수량": "총재고 (정상+불량 합계)", "불량환산": "불량재고 (환산 EA)"}[x],
-        horizontal=True,
-    )
-
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("총 재고 수량 (EA)", f"{int(inv_merged[qty_metric].sum()):,}")
-k2.metric("Acnes 재고", f"{int(inv_merged[inv_merged['브랜드'] == 'Acnes'][qty_metric].sum()):,}")
-k3.metric("Lipcare 재고", f"{int(inv_merged[inv_merged['브랜드'] == 'Lipcare'][qty_metric].sum()):,}")
-k4.metric("HADALABO 재고", f"{int(inv_merged[inv_merged['브랜드'] == 'HADALABO'][qty_metric].sum()):,}")
-
-brand_summary = (
-    inv_merged.groupby("브랜드", as_index=False)[qty_metric]
-    .sum()
-    .sort_values(by=qty_metric, ascending=False)
+# 수량 기준 선택
+qty_metric = st.radio(
+    "수량 기준 선택",
+    options=["정상환산", "합계수량", "불량환산"],
+    format_func=lambda x: {
+        "정상환산": "정상재고 (환산 EA)",
+        "합계수량": "총재고 (정상+불량 합계)",
+        "불량환산": "불량재고 (환산 EA)",
+    }[x],
+    horizontal=True,
 )
 
-chart_brand_df = brand_summary.rename(columns={qty_metric: "재고수량(EA)"})
-st.bar_chart(
-    data=chart_brand_df,
-    x="브랜드",
-    y="재고수량(EA)",
-    color="브랜드",
-    height=400,
-    use_container_width=True,
-)
+# KPI 요약
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("선택 기준 총 재고 (EA)", f"{int(inv_merged[qty_metric].sum()):,}")
+k2.metric("다이소-아크네스", f"{int(inv_merged[inv_merged['브랜드'] == '다이소-아크네스'][qty_metric].sum()):,}")
+k3.metric("Acnes", f"{int(inv_merged[inv_merged['브랜드'] == 'Acnes'][qty_metric].sum()):,}")
+k4.metric("Lipcare", f"{int(inv_merged[inv_merged['브랜드'] == 'Lipcare'][qty_metric].sum()):,}")
+k5.metric("HADALABO", f"{int(inv_merged[inv_merged['브랜드'] == 'HADALABO'][qty_metric].sum()):,}")
 
-st.markdown('<div class="section-title">🔎 브랜드 선택 및 상세 재고 내역 조회</div>', unsafe_allow_html=True)
+# SKU별 집계 및 출고 데이터 결합
+sku_qty = inv_merged.groupby("상품", as_index=False)[["정상환산", "불량환산", "합계수량"]].sum()
+sku_view = sku_classified.merge(sku_qty, on="상품", how="left").fillna(0)
 
-available_brands = brand_summary["브랜드"].tolist()
-if st.session_state["selected_brand"] not in available_brands and available_brands:
-    st.session_state["selected_brand"] = available_brands[0]
+if outbound_df is not None and not outbound_df.empty:
+    sku_view = sku_view.merge(outbound_df, on="상품", how="left")
+    sku_view["누적_출고수량"] = sku_view["누적_출고수량"].fillna(0.0)
+    sku_view["출고_발생일수"] = sku_view["출고_발생일수"].fillna(0).astype(int)
+    sku_view["일평균_출고량"] = sku_view["일평균_출고량"].fillna(0.0)
+    sku_view["월예상_출고량"] = sku_view["월예상_출고량"].fillna(0.0)
+else:
+    # 일일출고 파일 미업로드 시 현재 재고 기반 기본 추정치(30일 회전 가정) 제공
+    sku_view["누적_출고수량"] = 0.0
+    sku_view["출고_발생일수"] = 0
+    sku_view["일평균_출고량"] = (sku_view["정상환산"] / 30.0).round(2)
+    sku_view["월예상_출고량"] = sku_view["정상환산"].round(0)
 
-btn_cols = st.columns(min(len(available_brands), 6))
-for idx, b_name in enumerate(available_brands):
-    col_target = btn_cols[idx % len(btn_cols)]
-    is_active = st.session_state["selected_brand"] == b_name
-    b_qty = int(brand_summary.loc[brand_summary["브랜드"] == b_name, qty_metric].values[0])
-    if col_target.button(
-        f"{'✅ ' if is_active else ''}{b_name}\n({b_qty:,})",
-        key=f"btn_brand_{b_name}",
-        type="primary" if is_active else "secondary",
+# 메인 뷰 전환 버튼 (1번/2번 사항 반영: SCM 팔로우업은 '출고/수주 대비 커버리지(일수, DOH) 및 안전재고(Safety Stock) 알림'만 유지)
+v_col1, v_col2 = st.columns([1, 1])
+with v_col1:
+    if st.button(
+        "📊 브랜드 · 포트폴리오 현황 & 매핑 수정",
+        type="primary" if st.session_state["active_tab"] == "📊 브랜드·포트폴리오 현황" else "secondary",
         use_container_width=True,
     ):
-        st.session_state["selected_brand"] = b_name
+        st.session_state["active_tab"] = "📊 브랜드·포트폴리오 현황"
+        st.rerun()
+with v_col2:
+    if st.button(
+        "🛡️ SCM 팔로우업: 커버리지(DOH) & 안전재고(Safety Stock) 알림",
+        type="primary" if st.session_state["active_tab"] == "🛡️ SCM 팔로우업" else "secondary",
+        use_container_width=True,
+    ):
+        st.session_state["active_tab"] = "🛡️ SCM 팔로우업"
         st.rerun()
 
-sel_brand = st.session_state["selected_brand"]
-brand_detail_df = inv_merged[inv_merged["브랜드"] == sel_brand].copy()
+if st.session_state["active_tab"] == "📊 브랜드·포트폴리오 현황":
+    unassigned_sku_cnt = int((sku_view["브랜드"] == "미분류").sum())
 
-st.markdown(f"### 📌 [{sel_brand}] 상세 재고 및 포트폴리오 분석")
+    with st.expander(
+        f"🛠️ SKU별 브랜드 매핑 수정 (고유 품목 {len(sku_view)}종 | 미분류 {unassigned_sku_cnt}종)",
+        expanded=(unassigned_sku_cnt > 0),
+    ):
+        m_c1, m_c2 = st.columns([2, 1])
+        with m_c1:
+            q_search = st.text_input("🔍 제품코드 또는 제품명 검색", placeholder="예: ME00621DCP, 아크네스, 립, 하다라보...")
+        with m_c2:
+            q_only_un = st.checkbox("미분류 품목만 보기", value=False)
 
-if sel_brand in PORTFOLIO_OPTIONS:
-    p_col1, p_col2 = st.columns([1.2, 1.8])
-
-    with p_col1:
-        port_summary = (
-            brand_detail_df.groupby("최종_포트폴리오", as_index=False)[qty_metric]
-            .sum()
-            .sort_values(by=qty_metric, ascending=False)
-        )
-        chart_port_df = port_summary.rename(columns={"최종_포트폴리오": "포트폴리오", qty_metric: "재고수량(EA)"})
-        st.bar_chart(
-            data=chart_port_df,
-            x="포트폴리오",
-            y="재고수량(EA)",
-            color="포트폴리오",
-            height=360,
-            use_container_width=True,
-        )
-
-    with p_col2:
-        prod_check_df = (
-            brand_detail_df.groupby(["상품", "상품명", "최종_포트폴리오", "검수상태", "판별근거"], as_index=False)[
-                qty_metric
-            ]
-            .sum()
-            .sort_values(by=["검수상태", qty_metric], ascending=[True, False])
-        )
-        need_review_cnt = (prod_check_df["검수상태"] == "⚠️ 확인필요").sum()
-
-        if need_review_cnt > 0:
-            st.warning(
-                f"⚠️ **{sel_brand}** 품목 중 포트폴리오 이미지와 100% 일치하지 않거나 신규 라인인 **{need_review_cnt}개 품목**이 감지되었습니다. 아래 표에서 포트폴리오를 직접 수정해 주세요."
+        edit_df = sku_view[["상품", "상품명", "브랜드"]].copy()
+        if q_search:
+            mask = edit_df["상품"].str.contains(q_search, case=False, na=False) | edit_df["상품명"].str.contains(
+                q_search, case=False, na=False
             )
-        else:
-            st.success(f"✅ **{sel_brand}**의 모든 품목이 포트폴리오 이미지와 정상 매칭되었습니다. (필요 시 아래에서 변경 가능)")
+            edit_df = edit_df[mask]
+        if q_only_un:
+            edit_df = edit_df[edit_df["브랜드"] == "미분류"]
 
-        show_only_review = st.checkbox(
-            "⚠️ 확인필요(미매칭/신규라인) 품목만 필터링하여 보기",
-            value=(need_review_cnt > 0),
-            key=f"chk_review_{sel_brand}",
-        )
-        display_check = (
-            prod_check_df[prod_check_df["검수상태"] == "⚠️ 확인필요"].copy()
-            if show_only_review
-            else prod_check_df.copy()
-        )
-
-        edited_port = st.data_editor(
-            display_check,
+        edited_b = st.data_editor(
+            edit_df,
             column_config={
                 "상품": st.column_config.TextColumn("제품코드", disabled=True),
                 "상품명": st.column_config.TextColumn("제품명", disabled=True),
-                "최종_포트폴리오": st.column_config.SelectboxColumn(
-                    "포트폴리오 (클릭 수정)",
-                    options=PORTFOLIO_OPTIONS[sel_brand],
-                    required=True,
-                ),
-                "검수상태": st.column_config.TextColumn("더블체크 상태", disabled=True),
-                "판별근거": st.column_config.TextColumn("매칭 사유", disabled=True),
-                qty_metric: st.column_config.NumberColumn("재고수량", format="%d", disabled=True),
+                "브랜드": st.column_config.SelectboxColumn("브랜드 (클릭 수정)", options=BRAND_CHOICES, required=True),
             },
             use_container_width=True,
             hide_index=True,
-            height=300,
-            key=f"port_editor_{sel_brand}",
+            height=240,
+            key="sku_brand_editor_v7",
         )
 
-        if not edited_port.equals(display_check):
-            for _, row in edited_port.iterrows():
-                orig_val = display_check.loc[display_check["상품"] == row["상품"], "최종_포트폴리오"].values[0]
-                if row["최종_포트폴리오"] != orig_val:
-                    st.session_state["portfolio_overrides"][row["상품"]] = row["최종_포트폴리오"]
+        changed_pairs = {}
+        orig_b_map = dict(zip(edit_df["상품"], edit_df["브랜드"]))
+        for r in edited_b.itertuples(index=False):
+            if r.브랜드 != orig_b_map.get(r.상품):
+                changed_pairs[r.상품] = r.브랜드
+        if changed_pairs:
+            st.session_state["brand_overrides"].update(changed_pairs)
             st.rerun()
 
-st.markdown(f"#### 📋 [{sel_brand}] 전체 재고 상세 내역 (센터 · LOT · 유효일자별)")
+        updated_master_export = sku_view[["상품", "브랜드", "상품명"]].rename(
+            columns={"상품": "제품코드", "상품명": "제품군"}
+        )
+        st.download_button(
+            label="💾 반영된 '브랜드_제품코드_마스터.xlsx' 다운로드",
+            data=to_excel_bytes(updated_master_export, sheet_name="Sheet1"),
+            file_name=DEFAULT_MASTER_FILE,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
-detail_cols = ["센터", "셀", "상품", "상품명", "최종_포트폴리오", "검수상태", "화주LOT", "유효일자", "정상환산", "불량환산", "합계수량"]
-detail_view = brand_detail_df[detail_cols].sort_values(by=["최종_포트폴리오", "상품", "유효일자"])
+    st.markdown('<div class="section-title">📊 브랜드별 전체 재고 현황</div>', unsafe_allow_html=True)
+    brand_sum = (
+        inv_merged.groupby("브랜드", as_index=False)[qty_metric]
+        .sum()
+        .sort_values(by=qty_metric, ascending=False)
+    )
+    st.bar_chart(
+        data=brand_sum.rename(columns={qty_metric: "재고수량(EA)"}),
+        x="브랜드",
+        y="재고수량(EA)",
+        color="브랜드",
+        height=360,
+        use_container_width=True,
+    )
 
-st.dataframe(
-    detail_view,
-    use_container_width=True,
-    hide_index=True,
-    height=380,
+    st.markdown('<div class="section-title">🔎 브랜드 선택 및 포트폴리오 · 상세 재고 조회</div>', unsafe_allow_html=True)
+    brands_list = brand_sum["브랜드"].tolist()
+    if st.session_state["selected_brand"] not in brands_list and brands_list:
+        st.session_state["selected_brand"] = brands_list[0]
+
+    b_cols = st.columns(min(len(brands_list), 6))
+    for i, b_name in enumerate(brands_list):
+        target_col = b_cols[i % len(b_cols)]
+        b_val = int(brand_sum.loc[brand_sum["브랜드"] == b_name, qty_metric].values[0])
+        is_sel = st.session_state["selected_brand"] == b_name
+        if target_col.button(
+            f"{'✅ ' if is_sel else ''}{b_name} ({b_val:,})",
+            key=f"sel_b_{b_name}",
+            type="primary" if is_sel else "secondary",
+            use_container_width=True,
+        ):
+            st.session_state["selected_brand"] = b_name
+            st.rerun()
+
+    sel_brand = st.session_state["selected_brand"]
+    brand_rows = inv_merged[inv_merged["브랜드"] == sel_brand]
+    st.markdown(f"### 📌 [{sel_brand}] 상세 재고 및 포트폴리오 분석")
+
+    if sel_brand in PORTFOLIO_OPTIONS:
+        c_left, c_right = st.columns([1.15, 1.85])
+        with c_left:
+            p_sum = (
+                brand_rows.groupby("최종_포트폴리오", as_index=False)[qty_metric]
+                .sum()
+                .sort_values(by=qty_metric, ascending=False)
+            )
+            st.bar_chart(
+                data=p_sum.rename(columns={"최종_포트폴리오": "포트폴리오", qty_metric: "재고수량(EA)"}),
+                x="포트폴리오",
+                y="재고수량(EA)",
+                color="포트폴리오",
+                height=320,
+                use_container_width=True,
+            )
+
+        with c_right:
+            b_sku_df = sku_view[sku_view["브랜드"] == sel_brand][
+                ["상품", "상품명", "최종_포트폴리오", "검수상태", "판별근거", qty_metric]
+            ].sort_values(by=["검수상태", qty_metric], ascending=[True, False])
+
+            need_cnt = int((b_sku_df["검수상태"] == "⚠️ 확인필요").sum())
+            if need_cnt > 0:
+                st.warning(f"⚠️ **{sel_brand}** 내 확인이 필요한 품목 **{need_cnt}종**이 있습니다. 아래 표에서 포트폴리오를 수정하세요.")
+            else:
+                st.success(f"✅ **{sel_brand}** 포트폴리오 분류가 완료되었습니다.")
+
+            only_rev = st.checkbox("⚠️ 확인필요 품목만 보기", value=(need_cnt > 0), key=f"only_rev_{sel_brand}")
+            show_p = b_sku_df[b_sku_df["검수상태"] == "⚠️ 확인필요"].copy() if only_rev else b_sku_df.copy()
+
+            edited_p = st.data_editor(
+                show_p,
+                column_config={
+                    "상품": st.column_config.TextColumn("제품코드", disabled=True),
+                    "상품명": st.column_config.TextColumn("제품명", disabled=True),
+                    "최종_포트폴리오": st.column_config.SelectboxColumn(
+                        "포트폴리오 (클릭 수정)", options=PORTFOLIO_OPTIONS[sel_brand], required=True
+                    ),
+                    "검수상태": st.column_config.TextColumn("검수상태", disabled=True),
+                    "판별근거": st.column_config.TextColumn("판별근거", disabled=True),
+                    qty_metric: st.column_config.NumberColumn("재고수량", format="%d", disabled=True),
+                },
+                use_container_width=True,
+                hide_index=True,
+                height=260,
+                key=f"p_edit_{sel_brand}",
+            )
+
+            orig_p_map = dict(zip(show_p["상품"], show_p["최종_포트폴리오"]))
+            p_changes = {}
+            for r in edited_p.itertuples(index=False):
+                if r.최종_포트폴리오 != orig_p_map.get(r.상품):
+                    p_changes[r.상품] = r.최종_포트폴리오
+            if p_changes:
+                st.session_state["portfolio_overrides"].update(p_changes)
+                st.rerun()
+
+    st.markdown(f"#### 📋 [{sel_brand}] 상세 재고 내역 (센터 · 셀 · LOT · 유효일자별)")
+    detail_cols = ["센터", "셀", "상품", "상품명", "최종_포트폴리오", "검수상태", "화주LOT", "유효일자", "정상환산", "불량환산", "합계수량"]
+    detail_df = brand_rows[detail_cols].sort_values(by=["최종_포트폴리오", "상품", "유효일자"])
+    st.dataframe(detail_df, use_container_width=True, hide_index=True, height=340)
+
+    st.download_button(
+        label=f"📥 [{sel_brand}] 상세 재고내역 엑셀 다운로드",
+        data=to_excel_bytes(detail_df, sheet_name=f"{sel_brand}_재고내역"),
+        file_name=f"{sel_brand}_상세재고내역.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+else:
+    # 1번 & 2번 & 6번 사항: '출고/수주 대비 커버리지(일수, DOH) 및 안전재고(Safety Stock) 알림' + 외국계 화장품 수입입고 리드타임 위험 수준 그래프
+    st.markdown('<div class="section-title">🛡️ 출고/수주 대비 커버리지(DOH) 및 안전재고(Safety Stock) 알림</div>', unsafe_allow_html=True)
+
+    if outbound_df is None:
+        st.info(
+            "💡 현재 '일일출고 현황' 파일이 미업로드 상태입니다. 상단 **2. '일일출고 현황' 파일 업로드**에 출고 데이터를 올리면 "
+            "실제 일평균 출고량 기준으로 DOH와 안전재고 미달 알림이 정확히 계산됩니다."
+        )
+
+    p_c1, p_c2, p_c3 = st.columns(3)
+    with p_c1:
+        import_lt_days = st.slider(
+            "외국계 화장품 수입입고 리드타임(일)",
+            min_value=30,
+            max_value=180,
+            value=90,
+            step=5,
+            help="해외 제조·선적·통관·입고 검수까지 통상 소요되는 일수(기본 90일)",
+        )
+    with p_c2:
+        safety_days = st.slider(
+            "안전재고 기준 일수(일)",
+            min_value=7,
+            max_value=90,
+            value=30,
+            step=5,
+            help="수요 변동/선적 지연 대비 완충 일수(기본 30일)",
+        )
+    with p_c3:
+        danger_days = st.slider(
+            "위험(결품·긴급발주) 커버리지 기준(일 미만)",
+            min_value=15,
+            max_value=120,
+            value=60,
+            step=5,
+            help="수입입고 리드타임 고려 시 위험 수준으로 판단하는 잔여 커버리지 일수",
+        )
+
+    scm_df = sku_view.copy()
+    scm_df["안전재고_수량(EA)"] = (scm_df["일평균_출고량"] * float(safety_days)).round(0)
+    scm_df["수입발주점(ROP, EA)"] = (scm_df["일평균_출고량"] * float(import_lt_days + safety_days)).round(0)
+    scm_df["커버리지(DOH, 일)"] = scm_df.apply(
+        lambda r: round(r["정상환산"] / r["일평균_출고량"], 1) if r["일평균_출고량"] > 0 else (999.0 if r["정상환산"] > 0 else 0.0),
+        axis=1,
+    )
+    scm_df["안전재고_과부족(EA)"] = (scm_df["정상환산"] - scm_df["안전재고_수량(EA)"]).round(0)
+
+    def _doh_status(r):
+        if r["일평균_출고량"] <= 0:
+            return "🟢 출고없음(재고확인)"
+        doh = r["커버리지(DOH, 일)"]
+        if doh < danger_days or r["정상환산"] < r["안전재고_수량(EA)"]:
+            return "🚨 위험(수입리드타임 대비 부족)"
+        if doh < (import_lt_days + safety_days):
+            return "⚠️ 주의(수입발주 검토 필요)"
+        return "✅ 안정(수입리드타임 확보)"
+
+    scm_df["SCM_알림상태"] = scm_df.apply(_doh_status, axis=1)
+
+    danger_cnt = int((scm_df["SCM_알림상태"].str.startswith("🚨")).sum())
+    caution_cnt = int((scm_df["SCM_알림상태"].str.startswith("⚠️")).sum())
+    safe_cnt = int((scm_df["SCM_알림상태"].str.startswith("✅")).sum())
+    ss_short_cnt = int((scm_df["안전재고_과부족(EA)"] < 0).sum())
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("🚨 위험 품목(DOH < 위험기준)", f"{danger_cnt:,}종")
+    m2.metric("⚠️ 주의 품목(발주검토 필요)", f"{caution_cnt:,}종")
+    m3.metric("🛡️ 안전재고 미달 품목", f"{ss_short_cnt:,}종")
+    m4.metric("✅ 안정 품목", f"{safe_cnt:,}종")
+
+    # 6번 사항: 커버리지 일수가 보통의 외국계 화장품 수입입고 고려 수준에서 위험 수준으로 가는 추이/분포 그래프
+    st.markdown('<div class="section-title">📉 수입입고 리드타임 고려 커버리지(DOH) 위험 수준 그래프</div>', unsafe_allow_html=True)
+
+    chart_mode = st.radio(
+        "그래프 보기 방식",
+        options=["품목별 DOH(커버리지 일수) vs 수입리드타임/위험기준", "브랜드별 평균 커버리지(DOH) 비교"],
+        horizontal=True,
+    )
+
+    if chart_mode.startswith("품목별"):
+        # 출고가 존재하는 품목 위주로 DOH 오름차순(위험한 순서) 정렬
+        active_doh = scm_df[scm_df["일평균_출고량"] > 0].sort_values(by="커버리지(DOH, 일)", ascending=True).head(30).copy()
+        if active_doh.empty:
+            active_doh = scm_df.sort_values(by="커버리지(DOH, 일)", ascending=True).head(30).copy()
+        active_doh["DOH_표시(일)"] = active_doh["커버리지(DOH, 일)"].clip(upper=365.0)
+        active_doh["위험기준선(일)"] = float(danger_days)
+        active_doh["수입리드타임선(일)"] = float(import_lt_days)
+
+        plot_df = active_doh.set_index("상품")[["DOH_표시(일)", "위험기준선(일)", "수입리드타임선(일)"]]
+        st.line_chart(plot_df, height=360, use_container_width=True)
+        st.caption(
+            f"※ 그래프 해석: 선이 아래로 내려가 **위험기준선({danger_days}일)**에 가까워지거나 밑돌면 외국계 화장품 수입입고 리드타임({import_lt_days}일) 내 결품 위험 구간입니다."
+        )
+    else:
+        b_doh = (
+            scm_df[scm_df["일평균_출고량"] > 0]
+            .groupby("브랜드", as_index=False)
+            .agg(
+                평균_DOH=("커버리지(DOH, 일)", lambda s: round(float(s.clip(upper=365.0).mean()), 1)),
+                정상재고_합계=("정상환산", "sum"),
+            )
+            .sort_values(by="평균_DOH", ascending=True)
+        )
+        if not b_doh.empty:
+            st.bar_chart(
+                data=b_doh,
+                x="브랜드",
+                y="평균_DOH",
+                color="브랜드",
+                height=360,
+                use_container_width=True,
+            )
+
+    filter_status = st.multiselect(
+        "알림 상태 필터",
+        options=["🚨 위험(수입리드타임 대비 부족)", "⚠️ 주의(수입발주 검토 필요)", "✅ 안정(수입리드타임 확보)", "🟢 출고없음(재고확인)"],
+        default=["🚨 위험(수입리드타임 대비 부족)", "⚠️ 주의(수입발주 검토 필요)"],
+    )
+    filtered_scm = scm_df[scm_df["SCM_알림상태"].isin(filter_status)] if filter_status else scm_df
+    filtered_scm = filtered_scm.sort_values(by=["커버리지(DOH, 일)", "안전재고_과부족(EA)"], ascending=[True, True])
+
+    scm_cols = [
+        "SCM_알림상태",
+        "상품",
+        "상품명",
+        "브랜드",
+        "정상환산",
+        "일평균_출고량",
+        "월예상_출고량",
+        "커버리지(DOH, 일)",
+        "안전재고_수량(EA)",
+        "안전재고_과부족(EA)",
+        "수입발주점(ROP, EA)",
+    ]
+    st.dataframe(filtered_scm[scm_cols], use_container_width=True, hide_index=True, height=320)
+
+    st.download_button(
+        label="📥 SCM 커버리지(DOH)·안전재고 알림 엑셀 다운로드",
+        data=to_excel_bytes(filtered_scm[scm_cols], sheet_name="DOH_안전재고_알림"),
+        file_name="SCM_커버리지_DOH_안전재고_알림.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+# 7번 사항: 제품 코드를 누르면 추후 달 별 예상 출고량과 재고가 선 그래프로 보이게
+st.markdown('<div class="section-title">📈 제품코드별 추후 월별 예상 출고량 및 예상 재고 추이(선 그래프)</div>', unsafe_allow_html=True)
+
+sku_list = sku_view["상품"].tolist()
+sku_label_map = {
+    row.상품: f"{row.상품} | {row.브랜드} | {row.상품명}"
+    for row in sku_view.itertuples(index=False)
+}
+
+default_sku = (
+    st.session_state["selected_forecast_sku"]
+    if st.session_state["selected_forecast_sku"] in sku_list
+    else (sku_list[0] if sku_list else "")
 )
 
-st.download_button(
-    label=f"📥 [{sel_brand}] 상세 재고내역 엑셀 다운로드",
-    data=to_excel_bytes(detail_view, sheet_name=f"{sel_brand}_재고내역"),
-    file_name=f"{sel_brand}_상세재고내역.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
+fc_c1, fc_c2, fc_c3 = st.columns([2.2, 1.0, 1.0])
+with fc_c1:
+    picked_sku = st.selectbox(
+        "제품코드 선택 (클릭하여 선택하면 월별 예상 출고량과 예상 재고 선 그래프가 갱신됩니다)",
+        options=sku_list,
+        index=sku_list.index(default_sku) if default_sku in sku_list else 0,
+        format_func=lambda c: sku_label_map.get(c, c),
+    )
+    st.session_state["selected_forecast_sku"] = picked_sku
+
+with fc_c2:
+    forecast_months = st.slider("예측 기간(개월)", min_value=3, max_value=12, value=6, step=1)
+
+with fc_c3:
+    growth_rate_pct = st.number_input("월 출고 성장률(%)", min_value=-50.0, max_value=100.0, value=0.0, step=5.0)
+
+if picked_sku:
+    sku_row = sku_view[sku_view["상품"] == picked_sku].iloc[0]
+    cur_stock = float(sku_row["정상환산"])
+    base_monthly_out = float(sku_row["월예상_출고량"])
+    if base_monthly_out <= 0 and float(sku_row["일평균_출고량"]) > 0:
+        base_monthly_out = float(sku_row["일평균_출고량"]) * 30.0
+
+    today_dt = date.today()
+    month_labels = []
+    proj_outbound = []
+    proj_stock = []
+
+    running_stock = cur_stock
+    for m_idx in range(1, int(forecast_months) + 1):
+        yr = today_dt.year + (today_dt.month + m_idx - 1) // 12
+        mo = (today_dt.month + m_idx - 1) % 12 + 1
+        m_label = f"{yr}-{mo:02d}"
+        m_out = base_monthly_out * ((1.0 + float(growth_rate_pct) / 100.0) ** (m_idx - 1))
+        running_stock = max(0.0, running_stock - m_out)
+
+        month_labels.append(m_label)
+        proj_outbound.append(round(m_out, 0))
+        proj_stock.append(round(running_stock, 0))
+
+    fc_chart_df = pd.DataFrame(
+        {
+            "월": month_labels,
+            "예상 출고량(EA)": proj_outbound,
+            "예상 잔여재고(EA)": proj_stock,
+        }
+    ).set_index("월")
+
+    fc_m1, fc_m2, fc_m3 = st.columns(3)
+    fc_m1.metric("선택 제품코드", picked_sku)
+    fc_m2.metric("현재 정상재고(EA)", f"{int(cur_stock):,}")
+    fc_m3.metric("기준 월 예상출고(EA)", f"{int(round(base_monthly_out)):,}")
+
+    st.line_chart(fc_chart_df, height=340, use_container_width=True)
+    st.dataframe(fc_chart_df.reset_index(), use_container_width=True, hide_index=True, height=220)
