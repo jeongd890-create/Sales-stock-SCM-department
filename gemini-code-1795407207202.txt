@@ -1,0 +1,4 @@
+inventory-dashboard/
+├── app.py                  # 메인 Streamlit 대시보드 코드
+├── 통합 문서1.xlsx          # 기본 마스터 코드표 (앱에서 실시간 수정 및 다운로드 지원)
+└── requirements.txt        # 패키지 의존성 목록
