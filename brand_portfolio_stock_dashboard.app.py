@@ -1,6 +1,7 @@
 import io
 import os
 import re
+import openpyxl
 import pandas as pd
 import streamlit as st
 
@@ -215,7 +216,7 @@ def load_default_master(primary_path: str = DEFAULT_MASTER_FILE, fallback_path: 
     target_path = primary_path if os.path.exists(primary_path) else (fallback_path if os.path.exists(fallback_path) else None)
     if target_path is None:
         return pd.DataFrame(columns=["제품코드", "브랜드", "제품군"])
-    df = pd.read_excel(target_path, sheet_name=0)
+    df = pd.read_excel(target_path, sheet_name=0, engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
     for col in ["제품코드", "브랜드", "제품군"]:
         if col not in df.columns:
@@ -228,96 +229,157 @@ def load_default_master(primary_path: str = DEFAULT_MASTER_FILE, fallback_path: 
     return df[["제품코드", "브랜드", "제품군"]]
 
 
-def generate_upload_template_bytes() -> bytes:
-    sample_cols = [
-        "순번",
-        "센터",
-        "셀",
-        "상품",
-        "상품명",
-        "화주LOT",
-        "유효일자",
-        "입수량(BOX)",
-        "정상수량_BOX",
-        "정상수량_EA",
-        "정상수량_환산",
-        "불량수량_환산",
-        "합계수량",
-    ]
-    sample_rows = [
-        [1, "코람코센터", "EE-01-10-10", "ME00621PSB", "아크네스 퍼펙트 솔루션 바디워시 500ml", "LOT2026A", "2029-07-07", 12, 10, 0, 120, 0, 120],
-        [2, "코람코센터", "EE-01-11-10", "KME90521MC3", "립아이스 매직칼라 딸기 #48 (New 2026)", "G04892", "2029-09-20", 48, 20, 0, 960, 0, 960],
-        [3, "코람코센터", "EE-01-12-10", "ME90621PR4", "하다라보 고쿠쥰 프리미엄 로션 170ml", "H2601", "2029-05-01", 12, 15, 0, 180, 0, 180],
-    ]
-    df_template = pd.DataFrame(sample_rows, columns=sample_cols)
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df_template.to_excel(writer, sheet_name="업로드 파일", index=False)
-    return buf.getvalue()
+def _find_col_index(row1: list, row2: list, target_name: str, fallback_idx: int | None = None) -> int | None:
+    for idx, val in enumerate(row1):
+        if val is not None and str(val).strip() == target_name:
+            return idx
+    for idx, val in enumerate(row2):
+        if val is not None and str(val).strip() == target_name:
+            return idx
+    return fallback_idx
 
 
-def parse_inventory_excel(uploaded_file) -> tuple[pd.DataFrame, str]:
-    xls = pd.ExcelFile(uploaded_file)
-    sheet_names = xls.sheet_names
+def _parse_warehouse_sheet(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+    """
+    물류창고에서 올려주는 '재고파일' 시트(1행 대분류/컬럼명, 2행 서브헤더 BOX/EA/환산, 3행~ 데이터)를
+    별도 수정 없이 그대로 읽어 표준 재고 테이블로 변환합니다.
+    """
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    ws = wb[sheet_name]
 
-    if "업로드 파일" in sheet_names:
-        df = pd.read_excel(xls, sheet_name="업로드 파일")
-        df.columns = [str(c).strip() for c in df.columns]
-        required = {"상품", "상품명", "정상수량_환산"}
-        if not required.issubset(set(df.columns)):
-            raise ValueError(f"'업로드 파일' 시트에 필수 컬럼({required})이 누락되었습니다.")
+    row1 = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    row2 = [ws.cell(2, c).value for c in range(1, ws.max_column + 1)]
 
-        out = pd.DataFrame()
-        out["센터"] = df["센터"].fillna("-") if "센터" in df.columns else "-"
-        out["셀"] = df["셀"].fillna("-") if "셀" in df.columns else "-"
-        out["상품"] = df["상품"].astype(str).str.strip()
-        out["상품명"] = df["상품명"].astype(str).str.strip()
-        out["화주LOT"] = df["화주LOT"].fillna("-").astype(str) if "화주LOT" in df.columns else "-"
-        out["유효일자"] = df["유효일자"].fillna("-").astype(str) if "유효일자" in df.columns else "-"
-        out["정상환산"] = pd.to_numeric(df["정상수량_환산"], errors="coerce").fillna(0)
-        out["불량환산"] = (
-            pd.to_numeric(df["불량수량_환산"], errors="coerce").fillna(0)
-            if "불량수량_환산" in df.columns
-            else 0
+    idx_seq = _find_col_index(row1, row2, "순번", 0)
+    idx_center = _find_col_index(row1, row2, "센터", 1)
+    idx_cell = _find_col_index(row1, row2, "셀", 2)
+    idx_prod = _find_col_index(row1, row2, "상품", 3)
+    idx_name = _find_col_index(row1, row2, "상품명", 4)
+    idx_lot = _find_col_index(row1, row2, "화주LOT", 6)
+    idx_exp = _find_col_index(row1, row2, "유효일자", 13)
+    idx_total = _find_col_index(row1, row2, "합계수량", 31)
+
+    # '정상수량'의 '환산' 컬럼 위치 탐색 (기본 index 27)
+    idx_norm_conv = 27
+    for idx, r1_val in enumerate(row1):
+        if r1_val is not None and "정상수량" in str(r1_val).strip():
+            for offset in range(0, 4):
+                c_pos = idx + offset
+                if c_pos < len(row2) and row2[c_pos] is not None and "환산" in str(row2[c_pos]).strip():
+                    idx_norm_conv = c_pos
+                    break
+            break
+
+    # '불량수량'의 '환산' 컬럼 위치 탐색 (기본 index 30)
+    idx_bad_conv = 30
+    for idx, r1_val in enumerate(row1):
+        if r1_val is not None and "불량수량" in str(r1_val).strip():
+            for offset in range(0, 4):
+                c_pos = idx + offset
+                if c_pos < len(row2) and row2[c_pos] is not None and "환산" in str(row2[c_pos]).strip():
+                    idx_bad_conv = c_pos
+                    break
+            break
+
+    # 2행이 서브헤더인지 판별하여 데이터 시작 행 결정
+    has_sub_header = any(
+        v is not None and str(v).strip() in {"BOX", "EA", "환산", "창고", "LOCATION"}
+        for v in row2
+    )
+    start_row = 3 if has_sub_header else 2
+
+    records = []
+    for r in range(start_row, ws.max_row + 1):
+        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+        if all(v is None or str(v).strip() == "" for v in vals):
+            continue
+
+        seq_val = vals[idx_seq] if idx_seq is not None and idx_seq < len(vals) else None
+        prod_val = vals[idx_prod] if idx_prod is not None and idx_prod < len(vals) else None
+        if seq_val is None and (prod_val is None or str(prod_val).strip() == ""):
+            continue
+
+        prod_str = str(prod_val or "").strip()
+        if not prod_str or prod_str.lower() == "nan":
+            continue
+
+        center_str = str(vals[idx_center] or "-").strip() if idx_center is not None and idx_center < len(vals) else "-"
+        cell_str = str(vals[idx_cell] or "-").strip() if idx_cell is not None and idx_cell < len(vals) else "-"
+        name_str = str(vals[idx_name] or "").strip() if idx_name is not None and idx_name < len(vals) else ""
+        lot_str = str(vals[idx_lot] or "-").strip() if idx_lot is not None and idx_lot < len(vals) else "-"
+
+        exp_raw = vals[idx_exp] if idx_exp is not None and idx_exp < len(vals) else None
+        exp_parsed = pd.to_datetime(exp_raw, errors="coerce")
+        exp_str = exp_parsed.strftime("%Y-%m-%d") if pd.notna(exp_parsed) else (str(exp_raw).strip() if exp_raw not in (None, "") else "-")
+
+        norm_raw = vals[idx_norm_conv] if idx_norm_conv is not None and idx_norm_conv < len(vals) else 0
+        bad_raw = vals[idx_bad_conv] if idx_bad_conv is not None and idx_bad_conv < len(vals) else 0
+        tot_raw = vals[idx_total] if idx_total is not None and idx_total < len(vals) else None
+
+        norm_num = pd.to_numeric(norm_raw, errors="coerce")
+        bad_num = pd.to_numeric(bad_raw, errors="coerce")
+        tot_num = pd.to_numeric(tot_raw, errors="coerce")
+
+        norm_val = 0.0 if pd.isna(norm_num) else float(norm_num)
+        bad_val = 0.0 if pd.isna(bad_num) else float(bad_num)
+        tot_val = (norm_val + bad_val) if pd.isna(tot_num) else float(tot_num)
+
+        records.append(
+            {
+                "센터": center_str or "-",
+                "셀": cell_str or "-",
+                "상품": prod_str,
+                "상품명": name_str,
+                "화주LOT": lot_str or "-",
+                "유효일자": exp_str or "-",
+                "정상환산": norm_val,
+                "불량환산": bad_val,
+                "합계수량": tot_val,
+            }
         )
-        out["합계수량"] = (
-            pd.to_numeric(df["합계수량"], errors="coerce").fillna(out["정상환산"] + out["불량환산"])
-            if "합계수량" in df.columns
-            else out["정상환산"] + out["불량환산"]
-        )
-        out = out[out["상품"].notna() & (out["상품"] != "") & (out["상품"] != "nan")].copy()
-        return out, "표준 양식('업로드 파일' 시트) 로드 완료"
 
-    if "sheet1" in sheet_names:
-        df = pd.read_excel(xls, sheet_name="sheet1", header=1)
+    out = pd.DataFrame(records)
+    if out.empty:
+        raise ValueError(f"'{sheet_name}' 시트에서 유효한 재고 행을 찾지 못했습니다.")
+    return out
+
+
+def parse_inventory_file(uploaded_file) -> tuple[pd.DataFrame, str]:
+    file_bytes = uploaded_file.getvalue()
+    fname = getattr(uploaded_file, "name", "").lower()
+
+    if fname.endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(file_bytes))
         df.columns = [str(c).strip() for c in df.columns]
-        if "순번" in df.columns:
-            df = df[df["순번"].notna()].copy()
-        if "상품" not in df.columns or "환산" not in df.columns:
-            raise ValueError("'sheet1' 시트의 헤더 구조가 올바르지 않습니다. 표준 '업로드 파일' 양식을 사용해 주세요.")
-
         out = pd.DataFrame()
         out["센터"] = df["센터"].fillna("-") if "센터" in df.columns else "-"
         out["셀"] = df["셀"].fillna("-") if "셀" in df.columns else "-"
         out["상품"] = df["상품"].astype(str).str.strip()
         out["상품명"] = df["상품명"].astype(str).str.strip() if "상품명" in df.columns else ""
         out["화주LOT"] = df["화주LOT"].fillna("-").astype(str) if "화주LOT" in df.columns else "-"
-        out["유효일자"] = (
-            pd.to_datetime(df["유효일자"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("-")
-            if "유효일자" in df.columns
-            else "-"
-        )
-        out["정상환산"] = pd.to_numeric(df["환산"], errors="coerce").fillna(0)
-        out["불량환산"] = pd.to_numeric(df["환산.1"], errors="coerce").fillna(0) if "환산.1" in df.columns else 0
+        out["유효일자"] = df["유효일자"].fillna("-").astype(str) if "유효일자" in df.columns else "-"
+        qty_col = "정상수량_환산" if "정상수량_환산" in df.columns else ("환산" if "환산" in df.columns else None)
+        out["정상환산"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0) if qty_col else 0
+        out["불량환산"] = pd.to_numeric(df["불량수량_환산"], errors="coerce").fillna(0) if "불량수량_환산" in df.columns else 0
         out["합계수량"] = (
             pd.to_numeric(df["합계수량"], errors="coerce").fillna(out["정상환산"] + out["불량환산"])
             if "합계수량" in df.columns
             else out["정상환산"] + out["불량환산"]
         )
         out = out[out["상품"].notna() & (out["상품"] != "") & (out["상품"] != "nan")].copy()
-        return out, "WMS 원본 양식('sheet1' 시트) 자동 변환 로드 완료"
+        return out, "CSV 재고파일 로드 완료"
 
-    raise ValueError("엑셀 파일 내에 '업로드 파일' 시트(또는 'sheet1')가 존재하지 않습니다. 양식 틀을 확인해 주세요.")
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
+    sheet_names = wb.sheetnames
+    wb.close()
+
+    if "재고파일" in sheet_names:
+        return _parse_warehouse_sheet(file_bytes, "재고파일"), "물류창고 '재고파일' 시트 그대로 로드 완료"
+
+    if "sheet1" in sheet_names:
+        return _parse_warehouse_sheet(file_bytes, "sheet1"), "물류창고 'sheet1' 시트 그대로 로드 완료"
+
+    return _parse_warehouse_sheet(file_bytes, sheet_names[0]), f"재고파일('{sheet_names[0]}' 시트) 그대로 로드 완료"
 
 
 def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
@@ -337,32 +399,21 @@ if "selected_brand" not in st.session_state:
     st.session_state["selected_brand"] = "Acnes"
 
 st.title("📦 브랜드 및 포트폴리오별 통합 재고 현황 대시보드")
-st.caption("브랜드_제품코드_마스터와 '업로드 파일' 양식의 재고 데이터를 결합하여 브랜드·포트폴리오별 재고를 실시간 분석합니다.")
+st.caption("물류창고에서 올려주는 재고파일('재고파일.xlsx')을 별도 가공 없이 그대로 업로드하여 브랜드·포트폴리오별 재고를 실시간 분석합니다.")
 
 with st.container(border=True):
-    up_col1, up_col2 = st.columns([3, 1.2])
-    with up_col1:
-        uploaded_inv = st.file_uploader(
-            "📂 재고 파일 업로드 ('업로드 파일' 시트 양식 또는 WMS 재고 엑셀)",
-            type=["xlsx", "xls"],
-            help="반드시 지정된 '업로드 파일' 시트 형식에 맞추어 업로드해 주세요.",
-        )
-    with up_col2:
-        st.write("")
-        st.download_button(
-            label="📥 '업로드 파일' 표준 양식 다운로드",
-            data=generate_upload_template_bytes(),
-            file_name="업로드 파일.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
+    uploaded_inv = st.file_uploader(
+        "📂 물류창고 재고파일 그대로 업로드 ('재고파일' 시트 양식)",
+        type=["xlsx", "csv"],
+        help="물류창고에서 내려받은 원본 재고파일('재고파일' 시트)을 수정 없이 그대로 올려주세요.",
+    )
 
 if uploaded_inv is None:
-    st.info("👆 상단에서 재고 엑셀 파일을 업로드하면 브랜드별 재고 막대그래프와 포트폴리오 분석이 즉시 실행됩니다.")
+    st.info("👆 물류창고에서 내려받은 재고파일을 그대로 업로드하면 브랜드별 재고 막대그래프와 포트폴리오 분석이 즉시 실행됩니다.")
     st.stop()
 
 try:
-    inv_df, load_msg = parse_inventory_excel(uploaded_inv)
+    inv_df, load_msg = parse_inventory_file(uploaded_inv)
     st.success(f"✅ {load_msg} (총 {len(inv_df):,}건 / 고유 품목 {inv_df['상품'].nunique():,}종)")
 except Exception as e:
     st.error(f"❌ 파일 형식 오류: {e}")
