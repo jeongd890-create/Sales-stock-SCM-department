@@ -2,12 +2,8 @@ import io
 import os
 import re
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 
-# -----------------------------------------------------------------------------
-# 1. 페이지 설정 및 커스텀 스타일
-# -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="브랜드 및 포트폴리오별 재고 현황 대시보드",
     page_icon="📦",
@@ -41,9 +37,6 @@ st.markdown(
 DEFAULT_MASTER_FILE = "브랜드_제품코드_마스터.xlsx"
 FALLBACK_MASTER_FILE = "통합 문서1.xlsx"
 
-# -----------------------------------------------------------------------------
-# 2. 첨부 포트폴리오 이미지 기반 공식 카테고리 정의 및 매칭 규칙
-# -----------------------------------------------------------------------------
 PORTFOLIO_OPTIONS = {
     "Acnes": [
         "클렌징",
@@ -89,10 +82,6 @@ BRAND_CHOICES = [
 
 
 def classify_portfolio(brand: str, product_name: str) -> tuple[str, str, str]:
-    """
-    첨부된 포트폴리오 이미지(아크네스, 립, 하다라보) 기준으로 제품명을 매칭하고
-    더블체크 상태(일치 / 확인필요) 및 사유를 반환합니다.
-    """
     name = str(product_name or "").strip()
     name_clean = re.sub(r"\s+", "", name).lower()
 
@@ -203,9 +192,6 @@ def classify_portfolio(brand: str, product_name: str) -> tuple[str, str, str]:
     return "-", "해당없음", "기타 브랜드"
 
 
-# -----------------------------------------------------------------------------
-# 3. 데이터 로딩 및 표준 양식(업로드 파일) 처리 함수
-# -----------------------------------------------------------------------------
 def normalize_brand_name(val: str) -> str:
     s = str(val or "").strip()
     mapping = {
@@ -243,7 +229,6 @@ def load_default_master(primary_path: str = DEFAULT_MASTER_FILE, fallback_path: 
 
 
 def generate_upload_template_bytes() -> bytes:
-    """조건 4 & 5: '업로드 파일' 시트명을 가진 표준 재고 업로드 양식 생성"""
     sample_cols = [
         "순번",
         "센터",
@@ -272,11 +257,6 @@ def generate_upload_template_bytes() -> bytes:
 
 
 def parse_inventory_excel(uploaded_file) -> tuple[pd.DataFrame, str]:
-    """
-    업로드된 재고 엑셀 파일을 검증하고 표준 DataFrame으로 파싱합니다.
-    1순위: '업로드 파일' 시트 (표준 양식)
-    2순위: 'sheet1' 시트 (WMS 원본 양식 자동 호환)
-    """
     xls = pd.ExcelFile(uploaded_file)
     sheet_names = xls.sheet_names
 
@@ -347,9 +327,6 @@ def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
     return buf.getvalue()
 
 
-# -----------------------------------------------------------------------------
-# 4. 세션 상태 초기화
-# -----------------------------------------------------------------------------
 if "master_df" not in st.session_state:
     st.session_state["master_df"] = load_default_master()
 
@@ -359,9 +336,6 @@ if "portfolio_overrides" not in st.session_state:
 if "selected_brand" not in st.session_state:
     st.session_state["selected_brand"] = "Acnes"
 
-# -----------------------------------------------------------------------------
-# 5. 상단 헤더 및 재고 파일 업로드 영역 (조건 4, 5)
-# -----------------------------------------------------------------------------
 st.title("📦 브랜드 및 포트폴리오별 통합 재고 현황 대시보드")
 st.caption("브랜드_제품코드_마스터와 '업로드 파일' 양식의 재고 데이터를 결합하여 브랜드·포트폴리오별 재고를 실시간 분석합니다.")
 
@@ -394,9 +368,6 @@ except Exception as e:
     st.error(f"❌ 파일 형식 오류: {e}")
     st.stop()
 
-# -----------------------------------------------------------------------------
-# 6. 브랜드_제품코드_마스터 기반 신규 코드 탐지 및 메인 화면 실시간 수정 (조건 3)
-# -----------------------------------------------------------------------------
 master_df = st.session_state["master_df"].copy()
 master_codes = set(master_df["제품코드"].unique())
 inv_unique_items = inv_df[["상품", "상품명"]].drop_duplicates(subset=["상품"])
@@ -468,9 +439,6 @@ with st.expander(
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-# -----------------------------------------------------------------------------
-# 7. 재고 데이터 + 브랜드 + 포트폴리오 더블체크 결합
-# -----------------------------------------------------------------------------
 brand_map = dict(zip(st.session_state["master_df"]["제품코드"], st.session_state["master_df"]["브랜드"]))
 inv_df["브랜드"] = inv_df["상품"].map(brand_map).fillna("미분류")
 
@@ -494,9 +462,6 @@ inv_merged = inv_df.merge(
     how="left",
 )
 
-# -----------------------------------------------------------------------------
-# 8. 전체 요약 지표 및 브랜드별 재고 막대 그래프 (조건 1)
-# -----------------------------------------------------------------------------
 st.markdown('<div class="section-title">📊 브랜드별 전체 재고 현황</div>', unsafe_allow_html=True)
 
 ctrl_c1, ctrl_c2 = st.columns([2, 3])
@@ -520,29 +485,16 @@ brand_summary = (
     .sort_values(by=qty_metric, ascending=False)
 )
 
-fig_brand = px.bar(
-    brand_summary,
+chart_brand_df = brand_summary.rename(columns={qty_metric: "재고수량(EA)"})
+st.bar_chart(
+    data=chart_brand_df,
     x="브랜드",
-    y=qty_metric,
-    text=qty_metric,
+    y="재고수량(EA)",
     color="브랜드",
-    color_discrete_sequence=px.colors.qualitative.Set2,
-    title=f"브랜드별 재고 수량 현황 ({qty_metric})",
+    height=400,
+    use_container_width=True,
 )
-fig_brand.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
-fig_brand.update_layout(
-    height=430,
-    showlegend=False,
-    xaxis_title="브랜드",
-    yaxis_title="재고 수량 (EA)",
-    yaxis=dict(range=[0, brand_summary[qty_metric].max() * 1.15 if len(brand_summary) > 0 else 10]),
-    margin=dict(t=50, b=30, l=20, r=20),
-)
-st.plotly_chart(fig_brand, use_container_width=True)
 
-# -----------------------------------------------------------------------------
-# 9. 그래프 하단 브랜드 선택 박스 및 상세 재고내역 (조건 6)
-# -----------------------------------------------------------------------------
 st.markdown('<div class="section-title">🔎 브랜드 선택 및 상세 재고 내역 조회</div>', unsafe_allow_html=True)
 
 available_brands = brand_summary["브랜드"].tolist()
@@ -566,13 +518,10 @@ for idx, b_name in enumerate(available_brands):
 sel_brand = st.session_state["selected_brand"]
 brand_detail_df = inv_merged[inv_merged["브랜드"] == sel_brand].copy()
 
-# -----------------------------------------------------------------------------
-# 10. 선택 브랜드 내 포트폴리오별 구분 & 더블체크 수정 (조건 7, 8, 9)
-# -----------------------------------------------------------------------------
 st.markdown(f"### 📌 [{sel_brand}] 상세 재고 및 포트폴리오 분석")
 
 if sel_brand in PORTFOLIO_OPTIONS:
-    p_col1, p_col2 = st.columns([1.3, 1.7])
+    p_col1, p_col2 = st.columns([1.2, 1.8])
 
     with p_col1:
         port_summary = (
@@ -580,24 +529,15 @@ if sel_brand in PORTFOLIO_OPTIONS:
             .sum()
             .sort_values(by=qty_metric, ascending=False)
         )
-        fig_port = px.bar(
-            port_summary,
-            x="최종_포트폴리오",
-            y=qty_metric,
-            text=qty_metric,
-            color="최종_포트폴리오",
-            title=f"{sel_brand} 포트폴리오별 재고 분포",
+        chart_port_df = port_summary.rename(columns={"최종_포트폴리오": "포트폴리오", qty_metric: "재고수량(EA)"})
+        st.bar_chart(
+            data=chart_port_df,
+            x="포트폴리오",
+            y="재고수량(EA)",
+            color="포트폴리오",
+            height=360,
+            use_container_width=True,
         )
-        fig_port.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
-        fig_port.update_layout(
-            height=380,
-            showlegend=False,
-            xaxis_title="포트폴리오 카테고리",
-            yaxis_title="재고 수량 (EA)",
-            yaxis=dict(range=[0, port_summary[qty_metric].max() * 1.18 if len(port_summary) > 0 else 10]),
-            margin=dict(t=45, b=30, l=15, r=15),
-        )
-        st.plotly_chart(fig_port, use_container_width=True)
 
     with p_col2:
         prod_check_df = (
@@ -654,7 +594,6 @@ if sel_brand in PORTFOLIO_OPTIONS:
                     st.session_state["portfolio_overrides"][row["상품"]] = row["최종_포트폴리오"]
             st.rerun()
 
-# 선택 브랜드의 LOT / 센터별 전체 상세 내역 테이블
 st.markdown(f"#### 📋 [{sel_brand}] 전체 재고 상세 내역 (센터 · LOT · 유효일자별)")
 
 detail_cols = ["센터", "셀", "상품", "상품명", "최종_포트폴리오", "검수상태", "화주LOT", "유효일자", "정상환산", "불량환산", "합계수량"]
