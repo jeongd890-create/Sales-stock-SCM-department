@@ -1,7 +1,7 @@
 import io
 import os
 import re
-from datetime import date
+from datetime import date, timedelta
 import altair as alt
 import openpyxl
 import pandas as pd
@@ -43,14 +43,22 @@ NEW_SKU_TEMPLATE_FILE = "신규_제품코드_등록양식.xlsx"
 EXCLUDED_KEYWORDS = ("겔", "베르가못", "플라스타", "플라스마")
 GIFT_KEYWORDS = ("증정용", "증정", "사은품", "기프트", "gift", "샘플", "sample", "견본")
 
-# 8번: Lipcare 강제 지정 코드
 FORCE_LIPCARE_CODES = {"ME90521DME", "ME90521WC4", "ME90521WC5"}
 
-# 4번: 로션 구 ME코드 -> 신 ME코드 매핑 (접미사 1075->1001, 1100->1002, 1450->1003)
 LOTION_CODE_MIGRATION = {
     "ME90421075": "ME90421001",
     "ME90421100": "ME90421002",
     "ME90421450": "ME90421003",
+}
+
+# 7번: 변경된 ME코드 로션 3종(구·신 코드 포함)
+EXCLUDED_LOTION_DANGER_CODES = {
+    "ME90421075",
+    "ME90421001",
+    "ME90421100",
+    "ME90421002",
+    "ME90421450",
+    "ME90421003",
 }
 
 
@@ -68,7 +76,15 @@ def map_lotion_code(code: str) -> str:
     return c
 
 
-# 1번: 브랜드별 포트폴리오 세분화 옵션
+def is_migrated_lotion_code(code: str) -> bool:
+    c = str(code or "").strip().upper()
+    if c in EXCLUDED_LOTION_DANGER_CODES:
+        return True
+    if c.startswith("ME") and len(c) >= 6 and c.endswith(("1075", "1001", "1100", "1002", "1450", "1003")):
+        return True
+    return False
+
+
 PORTFOLIO_OPTIONS = {
     "Lotion": [
         "75ml",
@@ -341,11 +357,6 @@ def parse_warehouse_bytes(file_bytes: bytes, file_name: str) -> tuple[pd.DataFra
 
 @st.cache_data(show_spinner=False)
 def parse_outbound_bytes(file_bytes: bytes, file_name: str) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    """
-    '일일출고 현황' 파일 파싱:
-    - 4번 반영: 로션 구 ME코드(~1075->~1001, ~1100->~1002, ~1450->~1003) 출고량을 신 코드 출고량에 합산 반영
-    - 5번 반영: 최근 6개월(180일) 출고 이력이 있는 ME코드 집합(active_6m_codes) 산출
-    """
     fname = (file_name or "").lower()
     if fname.endswith(".csv"):
         raw_df = pd.read_csv(io.BytesIO(file_bytes))
@@ -432,7 +443,6 @@ def parse_outbound_bytes(file_bytes: bytes, file_name: str) -> tuple[pd.DataFram
         & (~cleaned["원본상품"].isin(["상품코드", "제품코드", "품목코드", "상품", "합계", "총계"]))
     ].copy()
 
-    # 4번: 로션 구 ME코드를 신 ME코드로 매핑하여 과거 출고량이 신 코드 출고량에 합산되도록 처리
     cleaned["상품"] = cleaned["원본상품"].apply(map_lotion_code)
 
     if date_col:
@@ -456,7 +466,6 @@ def parse_outbound_bytes(file_bytes: bytes, file_name: str) -> tuple[pd.DataFram
         denom_days = float(span_days)
         date_range_str = f"{min_dt.strftime('%Y-%m-%d')} ~ {max_dt.strftime('%Y-%m-%d')} ({span_days}일)"
 
-        # 5번: 최근 6개월(기준일 = 출고데이터 최신일자, 없으면 오늘) 내 출고 이력이 있는 코드 추출
         ref_dt = max_dt.normalize()
         cutoff_6m = ref_dt - pd.DateOffset(months=6)
         recent_rows = active_out[(active_out["출고일자"] >= cutoff_6m) & (active_out["출고수량"] > 0)]
@@ -535,13 +544,10 @@ def classify_skus_cached(
         name_clean = re.sub(r"\s+", "", name).lower()
         is_gift_name = any(k in name_clean for k in GIFT_KEYWORDS)
 
-        # 1) 브랜드 판별 우선순위
         if code in brand_ov:
             b = normalize_brand_name(brand_ov[code])
-        # 2번: 이름에 '용기'가 들어가면 부자재로 분류
         elif "용기" in name_clean:
             b = "부자재"
-        # 8번: ME90521DME, ME90521WC4, ME90521WC5는 모두 Lipcare 제품으로 분류
         elif code_upper in FORCE_LIPCARE_CODES:
             b = "Lipcare"
         elif is_gift_name:
@@ -570,8 +576,6 @@ def classify_skus_cached(
             else:
                 b = m_brand
 
-            # 5번: ME코드가 있지만 지난 6개월간 출고된 이력이 없는 경우 -> 단종 예상 재고로 분류
-            # (로션 신/구 매핑 코드 및 신규 등록 코드는 제외)
             mapped_c = map_lotion_code(code)
             if (
                 has_outbound_data
@@ -582,7 +586,6 @@ def classify_skus_cached(
             ):
                 b = "단종 예상 재고"
 
-        # 2) 브랜드별 세부 포트폴리오 판별
         if b == "부자재":
             ap, st_val, rsn = "부자재", "✅ 정상매칭", "제품명에 '용기' 포함 → 부자재 자동 분류"
         elif b == "단종 예상 재고":
@@ -590,7 +593,6 @@ def classify_skus_cached(
         elif b == "사은품":
             ap, st_val, rsn = "사은품", "✅ 정상매칭", "증정용/사은품 키워드 포함 → 사은품 분류"
 
-        # 1번-Lotion: 75, 100, 450ml 각 용량별 분류
         elif b == "Lotion":
             if "75ml" in name_clean or code_upper.endswith(("1075", "1001", "175S")):
                 ap, st_val, rsn = "75ml", "✅ 정상매칭", "Lotion 75ml 용량 분류"
@@ -601,7 +603,6 @@ def classify_skus_cached(
             else:
                 ap, st_val, rsn = "미분류(확인필요)", "⚠️ 확인필요", "Lotion 용량(75/100/450ml) 확인 필요"
 
-        # 1번-Spray: 쿨, 딥앤쿨, 익스트림
         elif b == "Spray":
             if "딥앤쿨" in name_clean:
                 ap, st_val, rsn = "딥앤쿨", "✅ 정상매칭", "Spray 딥앤쿨 라인"
@@ -610,9 +611,8 @@ def classify_skus_cached(
             elif "쿨" in name_clean or code_upper in {"ME0042118N", "ME00421185", "ME00421186", "ME00421175"}:
                 ap, st_val, rsn = "쿨", "✅ 정상매칭", "Spray 쿨 라인"
             else:
-                ap, st_val, rsn = "미분류(확인필요)", "⚠️ 확인필요", "Spray 세부 라인(쿨/딥앤쿨/익스트림) 확인 필요"
+                ap, st_val, rsn = "미분류(확인필요)", "⚠️ 확인필요", "Spray 세부 라인 확인 필요"
 
-        # 1번-HADALABO: 고쿠쥰, 프리미엄, 탄력 라인 구분
         elif b == "HADALABO":
             if "프리미엄" in name_clean or "premium" in name_clean:
                 ap, st_val, rsn = "프리미엄", "✅ 정상매칭", "HADALABO 프리미엄 라인"
@@ -629,7 +629,6 @@ def classify_skus_cached(
             else:
                 ap, st_val, rsn = "미분류(확인필요)", "⚠️ 확인필요", "HADALABO 세부 라인 확인 필요"
 
-        # 1번-Roll on Lotion: 핫과 쿨로 나눠서 보여주기
         elif b == "Roll on Lotion":
             if "핫&쿨" in name_clean or "핫앤쿨" in name_clean:
                 ap, st_val, rsn = "핫&쿨 번들", "✅ 정상매칭", "Roll on Lotion 핫&쿨 혼합 기획"
@@ -640,7 +639,6 @@ def classify_skus_cached(
             else:
                 ap, st_val, rsn = "미분류(확인필요)", "⚠️ 확인필요", "Roll on Lotion 핫/쿨 구분 확인 필요"
 
-        # 1번-Hand: 리치네일, 리치네일 리페어코트, 기획세트
         elif b == "Hand":
             if "기획세트" in name_clean or "기획" in name_clean or "&" in name_clean:
                 ap, st_val, rsn = "기획세트", "✅ 정상매칭", "Hand 리치네일&리페어코트 기획세트"
@@ -651,7 +649,6 @@ def classify_skus_cached(
             else:
                 ap, st_val, rsn = "미분류(확인필요)", "⚠️ 확인필요", "Hand 세부 라인 확인 필요"
 
-        # 1번-Melano: 엔자임페이스 워시, 안티스팟 화이트닝에센스
         elif b == "Melano":
             if "에센스" in name_clean or "안티스팟" in name_clean or "화이트닝" in name_clean:
                 ap, st_val, rsn = "안티스팟 화이트닝에센스", "✅ 정상매칭", "Melano 안티스팟 화이트닝에센스"
@@ -660,7 +657,6 @@ def classify_skus_cached(
             else:
                 ap, st_val, rsn = "미분류(확인필요)", "⚠️ 확인필요", "Melano 세부 라인 확인 필요"
 
-        # 6번 & 7번-Acnes: '티트리' -> '다이소 출고 제품', '마스크'/'패드' -> '스킨케어'
         elif b == "Acnes":
             if "티트리" in name_clean:
                 ap, st_val, rsn = "다이소 출고 제품", "✅ 정상매칭", "Acnes 제품명에 '티트리' 포함 → 다이소 출고 제품"
@@ -693,7 +689,10 @@ def classify_skus_cached(
                 ap, st_val, rsn = "메디케이티드", "✅ 정상매칭", "Lipcare 메디케이티드 라인 일치"
             elif "소프트립" in name_clean or "softlips" in name_clean:
                 ap, st_val, rsn = "소프트립스", "✅ 정상매칭", "Lipcare 소프트립스 라인 일치"
-            elif any(k in name_clean for k in ["매직컬러", "매직칼라", "틴티드컬러", "틴티드칼라", "워터컬러"]) or code_upper in {"ME90521WC4", "ME90521WC5"}:
+            elif (
+                any(k in name_clean for k in ["매직컬러", "매직칼라", "틴티드컬러", "틴티드칼라", "워터컬러"])
+                or code_upper in {"ME90521WC4", "ME90521WC5"}
+            ):
                 ap, st_val, rsn = "매직컬러 / 틴티드컬러 라인", "✅ 정상매칭", "Lipcare 컬러/틴티드 라인 일치"
             elif "립아이스" in name_clean or "lipice" in name_clean:
                 ap, st_val, rsn = "립아이스 프루티", "✅ 정상매칭", "립아이스 프루티 라인"
@@ -734,12 +733,20 @@ def get_template_bytes() -> bytes:
     if os.path.exists(NEW_SKU_TEMPLATE_FILE):
         with open(NEW_SKU_TEMPLATE_FILE, "rb") as f:
             return f.read()
-    cols = ["제품코드", "브랜드", "제품명(제품군)", "포트폴리오", "입수량(BOX)", "수입리드타임(일)", "안전재고일수(일)", "비고(채널/규격/특이사항)"]
+    cols = [
+        "제품코드",
+        "브랜드",
+        "제품명(제품군)",
+        "포트폴리오",
+        "입수량(BOX)",
+        "수입리드타임(일)",
+        "안전재고일수(일)",
+        "비고(채널/규격/특이사항)",
+    ]
     sample = [["ME00999NEW", "Acnes", "아크네스 화이트 티트리 시카 세럼 30mL (다이소)", "다이소 출고 제품", 24, 90, 30, "수입 리드타임 반영"]]
     return to_excel_bytes(pd.DataFrame(sample, columns=cols), sheet_name="신규제품_등록")
 
 
-# 세션 상태 초기화
 if "master_df" not in st.session_state:
     st.session_state["master_df"] = load_default_master()
 if "custom_skus" not in st.session_state:
@@ -755,7 +762,6 @@ if "active_tab" not in st.session_state:
 if "selected_forecast_sku" not in st.session_state:
     st.session_state["selected_forecast_sku"] = ""
 
-# 상단 타이틀 & 신규 제품코드 즉시 등록
 top_l, top_r = st.columns([1.35, 1.15])
 with top_l:
     st.title("📦 브랜드 및 포트폴리오별 통합 재고 현황")
@@ -812,7 +818,6 @@ with top_r:
                     st.success(f"신규 제품코드 '{clean_c}' ({new_brand})가 즉시 연동되었습니다.")
                     st.rerun()
 
-# 파일 업로더
 up_c1, up_c2 = st.columns(2)
 with up_c1:
     with st.container(border=True):
@@ -873,9 +878,9 @@ st.success(
     f"✅ {meta['source_label']} 로드 완료 | 전체 {meta['raw_total_rows']:,}건 중 제외({', '.join(EXCLUDED_KEYWORDS)}) {meta['excluded_rows']:,}건 "
     f"({int(meta['excluded_qty']):,} EA) 반영 → **분석 대상 {meta['final_rows']:,}건 (고유 SKU {meta['unique_skus']:,}종)**"
     + (
-        f" | 🚚 일일출고({outbound_info['div_col']}: {'매출' if outbound_info['used_sales_filter'] else '전체'}) {outbound_info['rows']:,}건 ({outbound_info['date_range']}) 연동됨 (로션 신·구 코드 합산 및 6개월 미출고 단종예상 자동 판별 활성)"
+        f" | 🚚 일일출고({outbound_info['div_col']}: {'매출' if outbound_info['used_sales_filter'] else '전체'}) {outbound_info['rows']:,}건 ({outbound_info['date_range']}) 연동됨"
         if outbound_info
-        else " | 💡 '일일출고 현황'을 올리면 로션 코드변경 합산 출고량 및 6개월 미출고 단종예상 재고가 자동 분류됩니다."
+        else " | 💡 '일일출고 현황'을 올리면 실출고 기반 지표와 단종예상 재고가 자동 산출됩니다."
     )
 )
 
@@ -931,8 +936,6 @@ k5.metric("단종 예상 재고", f"{int(inv_merged[inv_merged['브랜드'] == '
 
 sku_qty = inv_merged.groupby("상품", as_index=False)[["정상환산", "불량환산", "합계수량"]].sum()
 sku_view = sku_classified.merge(sku_qty, on="상품", how="left").fillna(0)
-
-# 4번: 출고 데이터 결합 시 로션 구 코드(~1075, ~1100, ~1450)도 신 코드 출고 실적을 참조할 수 있도록 매핑 컬럼으로 결합
 sku_view["출고매핑코드"] = sku_view["상품"].apply(map_lotion_code)
 
 if outbound_df is not None and not outbound_df.empty:
@@ -999,7 +1002,7 @@ if st.session_state["active_tab"] == "📊 브랜드·포트폴리오 현황":
             use_container_width=True,
             hide_index=True,
             height=240,
-            key="sku_brand_editor_v10",
+            key="sku_brand_editor_v11",
         )
 
         changed_pairs = {}
@@ -1069,7 +1072,6 @@ if st.session_state["active_tab"] == "📊 브랜드·포트폴리오 현황":
             )
             p_chart_df = p_sum.rename(columns={"최종_포트폴리오": "포트폴리오", qty_metric: "재고수량(EA)"})
 
-            # 1번-Melano: 그래프에 마우스를 가져가면 maf(디에이치, 메이크), mam(마트), mak(수입상태)로 나눠서 툴팁 표시
             if sel_brand == "Melano":
                 maf_qty = int(brand_rows[brand_rows["상품"] == "ME90621MAF"][qty_metric].sum())
                 mam_qty = int(brand_rows[brand_rows["상품"] == "ME90621MAM"][qty_metric].sum())
@@ -1195,47 +1197,155 @@ if st.session_state["active_tab"] == "📊 브랜드·포트폴리오 현황":
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
+    # 1번 & 4번: 브랜드·포트폴리오 현황 탭에서만 월별 예상 출고량 및 예상 재고 추이 선 그래프 표시
+    st.markdown('<div class="section-title">📈 제품코드별 추후 월별 예상 출고량 및 예상 재고 추이(선 그래프)</div>', unsafe_allow_html=True)
+
+    sku_list = sku_view["상품"].tolist()
+    sku_label_map = {
+        row.상품: f"{row.상품} | {row.브랜드} | {row.상품명}"
+        for row in sku_view.itertuples(index=False)
+    }
+
+    default_sku = (
+        st.session_state["selected_forecast_sku"]
+        if st.session_state["selected_forecast_sku"] in sku_list
+        else (sku_list[0] if sku_list else "")
+    )
+
+    fc_c1, fc_c2, fc_c3 = st.columns([2.2, 1.0, 1.0])
+    with fc_c1:
+        picked_sku = st.selectbox(
+            "제품코드 선택 (상세 재고 내역의 ME코드 검색과 연동됩니다)",
+            options=sku_list,
+            index=sku_list.index(default_sku) if default_sku in sku_list else 0,
+            format_func=lambda c: sku_label_map.get(c, c),
+        )
+        st.session_state["selected_forecast_sku"] = picked_sku
+
+    with fc_c2:
+        forecast_months = st.slider("향후 예측 기간(최대 6개월)", min_value=1, max_value=6, value=6, step=1)
+
+    with fc_c3:
+        growth_rate_pct = st.number_input("월 출고 성장률(%)", min_value=-50.0, max_value=100.0, value=0.0, step=5.0)
+
+    if picked_sku:
+        sku_row = sku_view[sku_view["상품"] == picked_sku].iloc[0]
+        cur_stock = float(sku_row["정상환산"])
+        mapped_code = map_lotion_code(picked_sku)
+
+        sku_m_hist = (
+            monthly_hist_df[monthly_hist_df["상품"] == mapped_code].sort_values("연월").copy()
+            if not monthly_hist_df.empty
+            else pd.DataFrame(columns=["상품", "연월", "출고수량"])
+        )
+
+        if outbound_df is not None and not sku_m_hist.empty:
+            base_monthly_out = float(sku_m_hist["출고수량"].mean())
+            if outbound_info and outbound_info.get("denom_days", 30) < 25:
+                daily_based = float(sku_row["일평균_출고량"]) * 30.0
+                base_monthly_out = max(base_monthly_out, daily_based) if base_monthly_out > 0 else daily_based
+        elif outbound_df is not None:
+            base_monthly_out = float(sku_row["일평균_출고량"]) * 30.0
+        else:
+            base_monthly_out = float(sku_row["월예상_출고량"])
+
+        today_dt = date.today()
+        rows_timeline = []
+
+        # 1번: 이전 실적은 모두 표시
+        if not sku_m_hist.empty:
+            for hr in sku_m_hist.itertuples(index=False):
+                rows_timeline.append(
+                    {
+                        "기간": f"{hr.연월} (실적)",
+                        "월별 출고량(EA)": round(float(hr.출고수량), 0),
+                        "예상 잔여재고(EA)": None,
+                    }
+                )
+
+        running_stock = cur_stock
+        for m_idx in range(1, int(forecast_months) + 1):
+            yr = today_dt.year + (today_dt.month + m_idx - 1) // 12
+            mo = (today_dt.month + m_idx - 1) % 12 + 1
+            m_label = f"{yr}-{mo:02d} (예상)"
+            m_out = base_monthly_out * ((1.0 + float(growth_rate_pct) / 100.0) ** (m_idx - 1))
+            running_stock = max(0.0, running_stock - m_out)
+
+            rows_timeline.append(
+                {
+                    "기간": m_label,
+                    "월별 출고량(EA)": round(m_out, 0),
+                    "예상 잔여재고(EA)": round(running_stock, 0),
+                }
+            )
+
+        fc_chart_df = pd.DataFrame(rows_timeline).set_index("기간")
+
+        fc_m1, fc_m2, fc_m3 = st.columns(3)
+        fc_m1.metric(
+            "선택 제품코드",
+            f"{picked_sku}" + (f" (출고합산:{mapped_code})" if mapped_code != picked_sku else ""),
+        )
+        fc_m2.metric("현재 정상재고(EA)", f"{int(cur_stock):,}")
+        fc_m3.metric("기준 월 출고량(EA)", f"{int(round(base_monthly_out)):,}")
+
+        st.line_chart(fc_chart_df, height=340, use_container_width=True)
+
+        fc_table_df = fc_chart_df.reset_index()
+
+        def _highlight_zero_stock_row(row):
+            rem = row.get("예상 잔여재고(EA)")
+            if pd.notna(rem) and float(rem) <= 0:
+                return ["background-color: #fee2e2; color: #b91c1c; font-weight: 700;"] * len(row)
+            return [""] * len(row)
+
+        styled_fc = fc_table_df.style.apply(_highlight_zero_stock_row, axis=1).format(
+            {
+                "월별 출고량(EA)": lambda v: f"{int(v):,}" if pd.notna(v) else "-",
+                "예상 잔여재고(EA)": lambda v: f"{int(v):,}" if pd.notna(v) else "-",
+            }
+        )
+        st.dataframe(styled_fc, use_container_width=True, hide_index=True, height=260)
+
 else:
+    # 4번, 5번, 6번: SCM 팔로우업 탭 (하단 월별 예상 선 그래프 제외, 전문 SCM 지표 구성)
     st.markdown('<div class="section-title">🛡️ 출고/수주 대비 커버리지(DOH) 및 안전재고(Safety Stock) 알림</div>', unsafe_allow_html=True)
 
     if outbound_df is None:
         st.info(
             "💡 현재 '일일출고 현황' 파일이 미업로드 상태입니다. 상단 **2. '일일출고 현황' 파일 업로드**에 출고 데이터를 올리면 "
-            "구분(매출)·Date·수량 기준으로 DOH와 안전재고 미달 알림이 계산됩니다."
+            "구분(매출)·Date·수량 기준으로 DOH, 회전율(ITO), 발주점(ROP), 결품예상일이 산출됩니다."
         )
 
     p_c1, p_c2, p_c3 = st.columns(3)
     with p_c1:
         import_lt_days = st.slider(
-            "외국계 화장품 수입입고 리드타임(일)",
+            "수입입고 리드타임(Lead Time, 일)",
             min_value=30,
             max_value=180,
             value=90,
             step=5,
-            help="해외 제조·선적·통관·입고 검수까지 통상 소요되는 일수(기본 90일)",
         )
     with p_c2:
         safety_days = st.slider(
-            "안전재고 기준 일수(일)",
+            "안전재고 기준 일수(Safety Stock Days, 일)",
             min_value=7,
             max_value=90,
             value=30,
             step=5,
-            help="수요 변동/선적 지연 대비 완충 일수(기본 30일)",
         )
     with p_c3:
         danger_days = st.slider(
-            "위험(결품·긴급발주) 커버리지 기준(일 미만)",
+            "위험 커버리지 기준(일 미만)",
             min_value=15,
             max_value=120,
             value=60,
             step=5,
-            help="수입입고 리드타임 고려 시 위험 수준으로 판단하는 잔여 커버리지 일수",
         )
 
     scm_df = sku_view.copy()
     scm_df["안전재고_수량(EA)"] = (scm_df["일평균_출고량"] * float(safety_days)).round(0)
-    scm_df["수입발주점(ROP, EA)"] = (scm_df["일평균_출고량"] * float(import_lt_days + safety_days)).round(0)
+    scm_df["발주점(ROP, EA)"] = (scm_df["일평균_출고량"] * float(import_lt_days + safety_days)).round(0)
     scm_df["커버리지(DOH, 일)"] = scm_df.apply(
         lambda r: round(r["정상환산"] / r["일평균_출고량"], 1)
         if r["일평균_출고량"] > 0
@@ -1243,79 +1353,194 @@ else:
         axis=1,
     )
     scm_df["안전재고_과부족(EA)"] = (scm_df["정상환산"] - scm_df["안전재고_수량(EA)"]).round(0)
+    scm_df["ROP_충족률(%)"] = scm_df.apply(
+        lambda r: round((r["정상환산"] / r["발주점(ROP, EA)"]) * 100.0, 1)
+        if r["발주점(ROP, EA)"] > 0
+        else (100.0 if r["정상환산"] > 0 else 0.0),
+        axis=1,
+    )
+    # 연간 환산 재고회전율(ITO = 연간예상출고량 / 현재정상재고)
+    scm_df["연간_재고회전율(ITO, 회)"] = scm_df.apply(
+        lambda r: round((r["일평균_출고량"] * 365.0) / r["정상환산"], 2)
+        if r["정상환산"] > 0 and r["일평균_출고량"] > 0
+        else 0.0,
+        axis=1,
+    )
+    scm_df["안전재고_여유일수(일)"] = (scm_df["커버리지(DOH, 일)"] - float(safety_days)).round(1)
+
+    base_today = date.today()
+
+    def _stockout_date_str(r):
+        if r["일평균_출고량"] <= 0:
+            return "-"
+        if r["정상환산"] <= 0:
+            return "즉시결품"
+        days_left = int(r["정상환산"] // r["일평균_출고량"])
+        if days_left > 730:
+            return "2년 이상"
+        return (base_today + timedelta(days=days_left)).strftime("%Y-%m-%d")
+
+    scm_df["예상_결품일"] = scm_df.apply(_stockout_date_str, axis=1)
 
     def _doh_status(r):
+        # 7번: 변경된 ME코드 로션 3종은 위험 필터에서 제외
+        if is_migrated_lotion_code(r["상품"]):
+            return "⚪ 로션코드변경_제외"
         if r["일평균_출고량"] <= 0:
             return "🟢 출고없음(재고확인)"
         doh = r["커버리지(DOH, 일)"]
         if doh < danger_days or r["정상환산"] < r["안전재고_수량(EA)"]:
             return "🚨 위험(수입리드타임 대비 부족)"
         if doh < (import_lt_days + safety_days):
-            return "⚠️ 주의(수입발주 검토 필요)"
-        return "✅ 안정(수입리드타임 확보)"
+            return "⚠️ 주의(발주검토 필요)"
+        return "✅ 안정(리드타임 확보)"
 
     scm_df["SCM_알림상태"] = scm_df.apply(_doh_status, axis=1)
 
-    danger_cnt = int((scm_df["SCM_알림상태"].str.startswith("🚨")).sum())
-    caution_cnt = int((scm_df["SCM_알림상태"].str.startswith("⚠️")).sum())
-    safe_cnt = int((scm_df["SCM_알림상태"].str.startswith("✅")).sum())
-    ss_short_cnt = int((scm_df["안전재고_과부족(EA)"] < 0).sum())
+    danger_cnt = int((scm_df["SCM_알림상태"] == "🚨 위험(수입리드타임 대비 부족)").sum())
+    caution_cnt = int((scm_df["SCM_알림상태"] == "⚠️ 주의(발주검토 필요)").sum())
+    ss_short_cnt = int(
+        ((~scm_df["상품"].apply(is_migrated_lotion_code)) & (scm_df["안전재고_과부족(EA)"] < 0)).sum()
+    )
+    avg_ito = round(float(scm_df[scm_df["연간_재고회전율(ITO, 회)"] > 0]["연간_재고회전율(ITO, 회)"].mean()), 2) if (scm_df["연간_재고회전율(ITO, 회)"] > 0).any() else 0.0
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("🚨 위험 품목(DOH < 위험기준)", f"{danger_cnt:,}종")
+    m1.metric("🚨 위험 품목(로션변경 제외)", f"{danger_cnt:,}종")
     m2.metric("⚠️ 주의 품목(발주검토 필요)", f"{caution_cnt:,}종")
     m3.metric("🛡️ 안전재고 미달 품목", f"{ss_short_cnt:,}종")
-    m4.metric("✅ 안정 품목", f"{safe_cnt:,}종")
+    m4.metric("🔄 평균 재고회전율(ITO)", f"{avg_ito:.2f}회/년")
 
+    # 2번 & 3번: 상단에 알림상태 필터 및 개별 ME코드 선택창 배치 후 하단에 그래프 표시
     st.markdown('<div class="section-title">📉 수입입고 리드타임 고려 커버리지(DOH) 위험 수준 그래프</div>', unsafe_allow_html=True)
 
-    chart_mode = st.radio(
-        "그래프 보기 방식",
-        options=["품목별 DOH(커버리지 일수) vs 수입리드타임/위험기준", "브랜드별 평균 커버리지(DOH) 비교"],
-        horizontal=True,
-    )
-
-    if chart_mode.startswith("품목별"):
-        active_doh = scm_df[scm_df["일평균_출고량"] > 0].sort_values(by="커버리지(DOH, 일)", ascending=True).head(30).copy()
-        if active_doh.empty:
-            active_doh = scm_df.sort_values(by="커버리지(DOH, 일)", ascending=True).head(30).copy()
-        active_doh["DOH_표시(일)"] = active_doh["커버리지(DOH, 일)"].clip(upper=365.0)
-        active_doh["위험기준선(일)"] = float(danger_days)
-        active_doh["수입리드타임선(일)"] = float(import_lt_days)
-
-        plot_df = active_doh.set_index("상품")[["DOH_표시(일)", "위험기준선(일)", "수입리드타임선(일)"]]
-        st.line_chart(plot_df, height=360, use_container_width=True)
-        st.caption(
-            f"※ 그래프 해석: 선이 아래로 내려가 **위험기준선({danger_days}일)**에 가까워지거나 밑돌면 외국계 화장품 수입입고 리드타임({import_lt_days}일) 내 결품 위험 구간입니다."
+    f_col1, f_col2, f_col3 = st.columns([1.4, 1.4, 1.2])
+    with f_col1:
+        filter_status = st.multiselect(
+            "알림 상태 필터",
+            options=[
+                "🚨 위험(수입리드타임 대비 부족)",
+                "⚠️ 주의(발주검토 필요)",
+                "✅ 안정(리드타임 확보)",
+                "🟢 출고없음(재고확인)",
+                "⚪ 로션코드변경_제외",
+            ],
+            default=["🚨 위험(수입리드타임 대비 부족)", "⚠️ 주의(발주검토 필요)"],
+            key="scm_alert_filter_top",
         )
-    else:
-        b_doh = (
-            scm_df[scm_df["일평균_출고량"] > 0]
-            .groupby("브랜드", as_index=False)
-            .agg(
-                평균_DOH=("커버리지(DOH, 일)", lambda s: round(float(s.clip(upper=365.0).mean()), 1)),
-                정상재고_합계=("정상환산", "sum"),
-            )
-            .sort_values(by="평균_DOH", ascending=True)
+    with f_col2:
+        code_candidates = (
+            scm_df[scm_df["SCM_알림상태"].isin(filter_status)]["상품"].tolist()
+            if filter_status
+            else scm_df["상품"].tolist()
         )
-        if not b_doh.empty:
-            st.bar_chart(
-                data=b_doh,
-                x="브랜드",
-                y="평균_DOH",
-                color="브랜드",
-                height=360,
-                use_container_width=True,
-            )
+        if not code_candidates:
+            code_candidates = scm_df["상품"].tolist()
+        picked_me_graph = st.selectbox(
+            "ME코드(상품코드) 선택 (선택 코드 1개 그래프 조회)",
+            options=["전체(상위 25개)"] + code_candidates,
+            index=0,
+            key="scm_single_me_selector",
+        )
+    with f_col3:
+        chart_metric_mode = st.selectbox(
+            "보조 지표 보기",
+            options=["DOH vs 리드타임/위험선", "ROP 충족률(%) & 안전재고 여유일수"],
+            index=0,
+            key="scm_metric_mode_selector",
+        )
 
-    filter_status = st.multiselect(
-        "알림 상태 필터",
-        options=["🚨 위험(수입리드타임 대비 부족)", "⚠️ 주의(수입발주 검토 필요)", "✅ 안정(수입리드타임 확보)", "🟢 출고없음(재고확인)"],
-        default=["🚨 위험(수입리드타임 대비 부족)", "⚠️ 주의(수입발주 검토 필요)"],
-    )
     filtered_scm = scm_df[scm_df["SCM_알림상태"].isin(filter_status)] if filter_status else scm_df
     filtered_scm = filtered_scm.sort_values(by=["커버리지(DOH, 일)", "안전재고_과부족(EA)"], ascending=[True, True])
 
+    if picked_me_graph == "전체(상위 25개)":
+        g_df = filtered_scm[filtered_scm["일평균_출고량"] > 0].head(25).copy()
+        if g_df.empty:
+            g_df = filtered_scm.head(25).copy()
+        g_df["DOH_표시(일)"] = g_df["커버리지(DOH, 일)"].clip(upper=365.0)
+        g_df["위험기준선(일)"] = float(danger_days)
+        g_df["수입리드타임선(일)"] = float(import_lt_days)
+
+        if chart_metric_mode == "DOH vs 리드타임/위험선":
+            melted = g_df.melt(
+                id_vars=["상품", "상품명", "SCM_알림상태"],
+                value_vars=["DOH_표시(일)", "위험기준선(일)", "수입리드타임선(일)"],
+                var_name="구분",
+                value_name="일수",
+            )
+            doh_chart = (
+                alt.Chart(melted)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("상품:N", sort=g_df["상품"].tolist(), title="ME코드(상품코드)"),
+                    y=alt.Y("일수:Q", title="일수(Days)"),
+                    color=alt.Color("구분:N", title="지표 구분"),
+                    tooltip=[
+                        alt.Tooltip("상품:N", title="ME코드"),
+                        alt.Tooltip("상품명:N", title="제품명"),
+                        alt.Tooltip("SCM_알림상태:N", title="알림상태"),
+                        alt.Tooltip("구분:N", title="구분"),
+                        alt.Tooltip("일수:Q", title="일수", format=".1f"),
+                    ],
+                )
+                .properties(height=340)
+            )
+            st.altair_chart(doh_chart, use_container_width=True)
+        else:
+            rop_chart = (
+                alt.Chart(g_df)
+                .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+                .encode(
+                    x=alt.X("상품:N", sort=g_df["상품"].tolist(), title="ME코드(상품코드)"),
+                    y=alt.Y("ROP_충족률(%):Q", title="ROP 충족률(%)"),
+                    color=alt.Color("SCM_알림상태:N", title="알림상태"),
+                    tooltip=[
+                        alt.Tooltip("상품:N", title="ME코드"),
+                        alt.Tooltip("상품명:N", title="제품명"),
+                        alt.Tooltip("ROP_충족률(%):Q", title="ROP 충족률(%)", format=".1f"),
+                        alt.Tooltip("안전재고_여유일수(일):Q", title="안전재고 여유일수(일)", format=".1f"),
+                        alt.Tooltip("연간_재고회전율(ITO, 회):Q", title="연간 재고회전율(ITO)", format=".2f"),
+                    ],
+                )
+                .properties(height=340)
+            )
+            st.altair_chart(rop_chart, use_container_width=True)
+    else:
+        one_row = scm_df[scm_df["상품"] == picked_me_graph].iloc[0]
+        s_c1, s_c2, s_c3, s_c4 = st.columns(4)
+        s_c1.metric("커버리지(DOH)", f"{one_row['커버리지(DOH, 일)']} 일")
+        s_c2.metric("ROP 충족률", f"{one_row['ROP_충족률(%)']} %")
+        s_c3.metric("연간 재고회전율(ITO)", f"{one_row['연간_재고회전율(ITO, 회)']} 회")
+        s_c4.metric("예상 결품일", f"{one_row['예상_결품일']}")
+
+        one_df = pd.DataFrame(
+            {
+                "항목": ["현재 DOH(일)", "안전재고 기준(일)", "위험기준선(일)", "수입리드타임(일)"],
+                "일수": [
+                    float(one_row["커버리지(DOH, 일)"]),
+                    float(safety_days),
+                    float(danger_days),
+                    float(import_lt_days),
+                ],
+            }
+        )
+        single_chart = (
+            alt.Chart(one_df)
+            .mark_bar(cornerRadiusTopLeft=5, cornerRadiusTopRight=5)
+            .encode(
+                x=alt.X("항목:N", sort=None, title="기준 항목"),
+                y=alt.Y("일수:Q", title="일수(Days)"),
+                color=alt.Color("항목:N", legend=None),
+                tooltip=[
+                    alt.Tooltip("항목:N", title="항목"),
+                    alt.Tooltip("일수:Q", title="일수(Days)", format=".1f"),
+                ],
+            )
+            .properties(height=300)
+        )
+        st.altair_chart(single_chart, use_container_width=True)
+
+    # 5번 & 6번: SCM 전문 지표 테이블 (재고회전율 ITO, ROP 충족률, 안전재고 여유일수, 예상 결품일)
+    st.markdown('<div class="section-title">📋 SCM 재고 건전성 및 발주·결품 관리 지표</div>', unsafe_allow_html=True)
     scm_cols = [
         "SCM_알림상태",
         "상품",
@@ -1326,123 +1551,17 @@ else:
         "월예상_출고량",
         "커버리지(DOH, 일)",
         "안전재고_수량(EA)",
-        "안전재고_과부족(EA)",
-        "수입발주점(ROP, EA)",
+        "안전재고_여유일수(일)",
+        "발주점(ROP, EA)",
+        "ROP_충족률(%)",
+        "연간_재고회전율(ITO, 회)",
+        "예상_결품일",
     ]
-    st.dataframe(filtered_scm[scm_cols], use_container_width=True, hide_index=True, height=320)
+    st.dataframe(filtered_scm[scm_cols], use_container_width=True, hide_index=True, height=340)
 
     st.download_button(
-        label="📥 SCM 커버리지(DOH)·안전재고 알림 엑셀 다운로드",
-        data=to_excel_bytes(filtered_scm[scm_cols], sheet_name="DOH_안전재고_알림"),
-        file_name="SCM_커버리지_DOH_안전재고_알림.xlsx",
+        label="📥 SCM 커버리지(DOH)·안전재고·회전율 지표 엑셀 다운로드",
+        data=to_excel_bytes(filtered_scm[scm_cols], sheet_name="SCM_지표_알림"),
+        file_name="SCM_커버리지_DOH_안전재고_지표.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
-# 3번, 4번, 9번 사항: 제품코드별 추후 월별 예상 출고량 및 예상 재고 추이(선 그래프)
-st.markdown('<div class="section-title">📈 제품코드별 추후 월별 예상 출고량 및 예상 재고 추이(선 그래프)</div>', unsafe_allow_html=True)
-
-sku_list = sku_view["상품"].tolist()
-sku_label_map = {
-    row.상품: f"{row.상품} | {row.브랜드} | {row.상품명}"
-    for row in sku_view.itertuples(index=False)
-}
-
-default_sku = (
-    st.session_state["selected_forecast_sku"]
-    if st.session_state["selected_forecast_sku"] in sku_list
-    else (sku_list[0] if sku_list else "")
-)
-
-fc_c1, fc_c2, fc_c3 = st.columns([2.2, 1.0, 1.0])
-with fc_c1:
-    picked_sku = st.selectbox(
-        "제품코드 선택 (상세 재고 내역의 ME코드 검색과 연동됩니다)",
-        options=sku_list,
-        index=sku_list.index(default_sku) if default_sku in sku_list else 0,
-        format_func=lambda c: sku_label_map.get(c, c),
-    )
-    st.session_state["selected_forecast_sku"] = picked_sku
-
-with fc_c2:
-    # 3번: 추후 예상은 최대 6달로 설정
-    forecast_months = st.slider("예측 기간(개월, 최대 6개월)", min_value=1, max_value=6, value=6, step=1)
-
-with fc_c3:
-    growth_rate_pct = st.number_input("월 출고 성장률(%)", min_value=-50.0, max_value=100.0, value=0.0, step=5.0)
-
-if picked_sku:
-    sku_row = sku_view[sku_view["상품"] == picked_sku].iloc[0]
-    cur_stock = float(sku_row["정상환산"])
-    mapped_code = map_lotion_code(picked_sku)
-
-    # 4번: 로션 신/구 코드 합산 출고 실적(mapped_code) 기준으로 월별 히스토리 조회
-    sku_m_hist = (
-        monthly_hist_df[monthly_hist_df["상품"] == mapped_code].sort_values("연월").copy()
-        if not monthly_hist_df.empty
-        else pd.DataFrame(columns=["상품", "연월", "출고수량"])
-    )
-
-    if outbound_df is not None and not sku_m_hist.empty:
-        base_monthly_out = float(sku_m_hist["출고수량"].mean())
-        if outbound_info and outbound_info.get("denom_days", 30) < 25:
-            daily_based = float(sku_row["일평균_출고량"]) * 30.0
-            base_monthly_out = max(base_monthly_out, daily_based) if base_monthly_out > 0 else daily_based
-    elif outbound_df is not None:
-        base_monthly_out = float(sku_row["일평균_출고량"]) * 30.0
-    else:
-        base_monthly_out = float(sku_row["월예상_출고량"])
-
-    today_dt = date.today()
-    rows_timeline = []
-
-    if not sku_m_hist.empty:
-        for hr in sku_m_hist.itertuples(index=False):
-            rows_timeline.append(
-                {
-                    "기간": f"{hr.연월} (실적)",
-                    "월별 출고량(EA)": round(float(hr.출고수량), 0),
-                    "예상 잔여재고(EA)": None,
-                }
-            )
-
-    running_stock = cur_stock
-    for m_idx in range(1, int(forecast_months) + 1):
-        yr = today_dt.year + (today_dt.month + m_idx - 1) // 12
-        mo = (today_dt.month + m_idx - 1) % 12 + 1
-        m_label = f"{yr}-{mo:02d} (예상)"
-        m_out = base_monthly_out * ((1.0 + float(growth_rate_pct) / 100.0) ** (m_idx - 1))
-        running_stock = max(0.0, running_stock - m_out)
-
-        rows_timeline.append(
-            {
-                "기간": m_label,
-                "월별 출고량(EA)": round(m_out, 0),
-                "예상 잔여재고(EA)": round(running_stock, 0),
-            }
-        )
-
-    fc_chart_df = pd.DataFrame(rows_timeline).set_index("기간")
-
-    fc_m1, fc_m2, fc_m3 = st.columns(3)
-    fc_m1.metric("선택 제품코드", f"{picked_sku}" + (f" (출고합산:{mapped_code})" if mapped_code != picked_sku else ""))
-    fc_m2.metric("현재 정상재고(EA)", f"{int(cur_stock):,}")
-    fc_m3.metric("기준 월 출고량(EA)", f"{int(round(base_monthly_out)):,}")
-
-    st.line_chart(fc_chart_df, height=340, use_container_width=True)
-
-    # 9번: 예상 잔여재고가 0이 되는 달은 빨간색으로 행 표시
-    fc_table_df = fc_chart_df.reset_index()
-
-    def _highlight_zero_stock_row(row):
-        rem = row.get("예상 잔여재고(EA)")
-        if pd.notna(rem) and float(rem) <= 0:
-            return ["background-color: #fee2e2; color: #b91c1c; font-weight: 700;"] * len(row)
-        return [""] * len(row)
-
-    styled_fc = fc_table_df.style.apply(_highlight_zero_stock_row, axis=1).format(
-        {
-            "월별 출고량(EA)": lambda v: f"{int(v):,}" if pd.notna(v) else "-",
-            "예상 잔여재고(EA)": lambda v: f"{int(v):,}" if pd.notna(v) else "-",
-        }
-    )
-    st.dataframe(styled_fc, use_container_width=True, hide_index=True, height=260)
