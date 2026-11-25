@@ -51,7 +51,6 @@ LOTION_CODE_MIGRATION = {
     "ME90421450": "ME90421003",
 }
 
-# 7번: 변경된 ME코드 로션 3종(구·신 코드 포함)
 EXCLUDED_LOTION_DANGER_CODES = {
     "ME90421075",
     "ME90421001",
@@ -86,62 +85,14 @@ def is_migrated_lotion_code(code: str) -> bool:
 
 
 PORTFOLIO_OPTIONS = {
-    "Lotion": [
-        "75ml",
-        "100ml",
-        "450ml",
-        "미분류(확인필요)",
-    ],
-    "Spray": [
-        "쿨",
-        "딥앤쿨",
-        "익스트림",
-        "미분류(확인필요)",
-    ],
-    "HADALABO": [
-        "고쿠쥰",
-        "프리미엄",
-        "탄력",
-        "시로쥰",
-        "키와미즈",
-        "타마고하다",
-        "미분류(확인필요)",
-    ],
-    "Roll on Lotion": [
-        "핫",
-        "쿨",
-        "핫&쿨 번들",
-        "미분류(확인필요)",
-    ],
-    "Hand": [
-        "리치네일",
-        "리치네일 리페어코트",
-        "기획세트",
-        "미분류(확인필요)",
-    ],
-    "Melano": [
-        "엔자임페이스 워시",
-        "안티스팟 화이트닝에센스",
-        "미분류(확인필요)",
-    ],
-    "Acnes": [
-        "다이소 출고 제품",
-        "스킨케어",
-        "클렌징",
-        "스팟패치",
-        "바디케어",
-        "포 맨",
-        "더마 스킨케어",
-        "미분류(확인필요)",
-    ],
-    "Lipcare": [
-        "립아이스 프루티",
-        "딥 모이스트",
-        "매직컬러 / 틴티드컬러 라인",
-        "메디케이티드",
-        "소프트립스",
-        "미분류(확인필요)",
-    ],
+    "Lotion": ["75ml", "100ml", "450ml", "미분류(확인필요)"],
+    "Spray": ["쿨", "딥앤쿨", "익스트림", "미분류(확인필요)"],
+    "HADALABO": ["고쿠쥰", "프리미엄", "탄력", "시로쥰", "키와미즈", "타마고하다", "미분류(확인필요)"],
+    "Roll on Lotion": ["핫", "쿨", "핫&쿨 번들", "미분류(확인필요)"],
+    "Hand": ["리치네일", "리치네일 리페어코트", "기획세트", "미분류(확인필요)"],
+    "Melano": ["엔자임페이스 워시", "안티스팟 화이트닝에센스", "미분류(확인필요)"],
+    "Acnes": ["다이소 출고 제품", "스킨케어", "클렌징", "스팟패치", "바디케어", "포 맨", "더마 스킨케어", "미분류(확인필요)"],
+    "Lipcare": ["립아이스 프루티", "딥 모이스트", "매직컬러 / 틴티드컬러 라인", "메디케이티드", "소프트립스", "미분류(확인필요)"],
 }
 
 BRAND_CHOICES = [
@@ -518,6 +469,67 @@ def parse_outbound_bytes(file_bytes: bytes, file_name: str) -> tuple[pd.DataFram
 
 
 @st.cache_data(show_spinner=False)
+def parse_nondelivery_bytes(file_bytes: bytes) -> tuple[pd.DataFrame, dict]:
+    xls = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
+    sheet_name = "미납내역(RAW)" if "미납내역(RAW)" in xls.sheet_names else xls.sheet_names[0]
+    df = pd.read_excel(xls, sheet_name=sheet_name)
+    df.columns = [str(c).replace("\n", " ").strip() for c in df.columns]
+
+    amt_col = next((c for c in df.columns if "미납금액" in c), None)
+    qty_col = next((c for c in df.columns if "미납" in c and "수량" in c), None)
+    reason_col = next((c for c in df.columns if "미납사유" in c), None)
+    ch_col = next((c for c in df.columns if "CHANNEL" in c.upper() or "채널" in c), None)
+    dt_col = next((c for c in df.columns if "납품일자" in c or "일자" in c), None)
+
+    out = df.copy()
+    out["미납금액_num"] = pd.to_numeric(out[amt_col], errors="coerce").fillna(0.0) if amt_col else 0.0
+    out["미납수량_num"] = pd.to_numeric(out[qty_col], errors="coerce").fillna(0.0) if qty_col else 0.0
+    out["미납사유_clean"] = out[reason_col].fillna("미기재").astype(str).str.strip() if reason_col else "미기재"
+    out["CHANNEL_clean"] = out[ch_col].fillna("미구분").astype(str).str.strip() if ch_col else "미구분"
+
+    if dt_col:
+        dt_parsed = pd.to_datetime(out[dt_col], errors="coerce").dropna()
+        months_cnt = max(int(dt_parsed.dt.to_period("M").nunique()), 1) if not dt_parsed.empty else 44
+        period_str = (
+            f"{dt_parsed.min().strftime('%Y-%m')} ~ {dt_parsed.max().strftime('%Y-%m')} ({months_cnt}개월)"
+            if not dt_parsed.empty
+            else "기간정보 없음(44개월 기준)"
+        )
+    else:
+        months_cnt = 44
+        period_str = "기간정보 없음(44개월 기준)"
+
+    def _root_cause(s: str) -> str:
+        if "수입" in s:
+            return "수입 지연/이슈"
+        if any(k in s for k in ["임가공", "덧방", "시험성적서", "입수변경", "불량이슈"]):
+            return "임가공/생산/품질이슈"
+        if any(k in s for k in ["재고", "단종"]):
+            return "재고부족/단종"
+        if any(k in s for k in ["납품 기준", "발주", "단가"]):
+            return "발주/납품기준/단가이슈"
+        if any(k in s for k in ["소터", "파손", "배송", "오이고", "거점", "오피킹", "오분배", "유통기한", "바코드", "표식지"]):
+            return "물류/센터/출고이슈"
+        if s == "미기재":
+            return "미기재"
+        return "기타"
+
+    out["원인대분류"] = out["미납사유_clean"].apply(_root_cause)
+    total_amt = float(out["미납금액_num"].sum())
+    annualized_amt = (total_amt / float(months_cnt)) * 12.0
+
+    meta = {
+        "rows": len(out),
+        "total_amt": total_amt,
+        "total_qty": float(out["미납수량_num"].sum()),
+        "months_cnt": months_cnt,
+        "period_str": period_str,
+        "annualized_amt": annualized_amt,
+    }
+    return out, meta
+
+
+@st.cache_data(show_spinner=False)
 def classify_skus_cached(
     unique_sku_df: pd.DataFrame,
     master_records: tuple[tuple[str, str], ...],
@@ -592,7 +604,6 @@ def classify_skus_cached(
             ap, st_val, rsn = "단종 예상 재고", "⚠️ 단종예상", "ME코드 보유 품목 중 최근 6개월 출고 이력 없음"
         elif b == "사은품":
             ap, st_val, rsn = "사은품", "✅ 정상매칭", "증정용/사은품 키워드 포함 → 사은품 분류"
-
         elif b == "Lotion":
             if "75ml" in name_clean or code_upper.endswith(("1075", "1001", "175S")):
                 ap, st_val, rsn = "75ml", "✅ 정상매칭", "Lotion 75ml 용량 분류"
@@ -602,7 +613,6 @@ def classify_skus_cached(
                 ap, st_val, rsn = "450ml", "✅ 정상매칭", "Lotion 450ml 용량 분류"
             else:
                 ap, st_val, rsn = "미분류(확인필요)", "⚠️ 확인필요", "Lotion 용량(75/100/450ml) 확인 필요"
-
         elif b == "Spray":
             if "딥앤쿨" in name_clean:
                 ap, st_val, rsn = "딥앤쿨", "✅ 정상매칭", "Spray 딥앤쿨 라인"
@@ -612,7 +622,6 @@ def classify_skus_cached(
                 ap, st_val, rsn = "쿨", "✅ 정상매칭", "Spray 쿨 라인"
             else:
                 ap, st_val, rsn = "미분류(확인필요)", "⚠️ 확인필요", "Spray 세부 라인 확인 필요"
-
         elif b == "HADALABO":
             if "프리미엄" in name_clean or "premium" in name_clean:
                 ap, st_val, rsn = "프리미엄", "✅ 정상매칭", "HADALABO 프리미엄 라인"
@@ -628,7 +637,6 @@ def classify_skus_cached(
                 ap, st_val, rsn = "고쿠쥰", "✅ 정상매칭", "HADALABO 고쿠쥰 기본 라인"
             else:
                 ap, st_val, rsn = "미분류(확인필요)", "⚠️ 확인필요", "HADALABO 세부 라인 확인 필요"
-
         elif b == "Roll on Lotion":
             if "핫&쿨" in name_clean or "핫앤쿨" in name_clean:
                 ap, st_val, rsn = "핫&쿨 번들", "✅ 정상매칭", "Roll on Lotion 핫&쿨 혼합 기획"
@@ -638,7 +646,6 @@ def classify_skus_cached(
                 ap, st_val, rsn = "쿨", "✅ 정상매칭", "Roll on Lotion 쿨 라인"
             else:
                 ap, st_val, rsn = "미분류(확인필요)", "⚠️ 확인필요", "Roll on Lotion 핫/쿨 구분 확인 필요"
-
         elif b == "Hand":
             if "기획세트" in name_clean or "기획" in name_clean or "&" in name_clean:
                 ap, st_val, rsn = "기획세트", "✅ 정상매칭", "Hand 리치네일&리페어코트 기획세트"
@@ -648,7 +655,6 @@ def classify_skus_cached(
                 ap, st_val, rsn = "리치네일", "✅ 정상매칭", "Hand 리치네일 단품"
             else:
                 ap, st_val, rsn = "미분류(확인필요)", "⚠️ 확인필요", "Hand 세부 라인 확인 필요"
-
         elif b == "Melano":
             if "에센스" in name_clean or "안티스팟" in name_clean or "화이트닝" in name_clean:
                 ap, st_val, rsn = "안티스팟 화이트닝에센스", "✅ 정상매칭", "Melano 안티스팟 화이트닝에센스"
@@ -656,7 +662,6 @@ def classify_skus_cached(
                 ap, st_val, rsn = "엔자임페이스 워시", "✅ 정상매칭", "Melano 엔자임페이스 워시"
             else:
                 ap, st_val, rsn = "미분류(확인필요)", "⚠️ 확인필요", "Melano 세부 라인 확인 필요"
-
         elif b == "Acnes":
             if "티트리" in name_clean:
                 ap, st_val, rsn = "다이소 출고 제품", "✅ 정상매칭", "Acnes 제품명에 '티트리' 포함 → 다이소 출고 제품"
@@ -681,7 +686,6 @@ def classify_skus_cached(
                 ap, st_val, rsn = "클렌징", "✅ 정상매칭", "Acnes 클렌징 라인"
             else:
                 ap, st_val, rsn = "미분류(확인필요)", "⚠️ 확인필요", "Acnes 포트폴리오 키워드 미일치"
-
         elif b == "Lipcare":
             if "딥모이스트" in name_clean or "deepmoist" in name_clean or code_upper == "ME90521DME":
                 ap, st_val, rsn = "딥 모이스트", "✅ 정상매칭", "Lipcare 딥 모이스트 라인 일치"
@@ -765,7 +769,7 @@ if "selected_forecast_sku" not in st.session_state:
 top_l, top_r = st.columns([1.35, 1.15])
 with top_l:
     st.title("📦 브랜드 및 포트폴리오별 통합 재고 현황")
-    st.caption("브랜드/포트폴리오 세분화 · 단종예상·부자재 자동분류 · 수입리드타임 기반 DOH·안전재고 팔로우업")
+    st.caption("브랜드/포트폴리오 세분화 · 단종예상·부자재 자동분류 · 수입리드타임 기반 DOH·ROP·회전율·미납률 관리")
 
 with top_r:
     with st.container(border=True):
@@ -818,20 +822,27 @@ with top_r:
                     st.success(f"신규 제품코드 '{clean_c}' ({new_brand})가 즉시 연동되었습니다.")
                     st.rerun()
 
-up_c1, up_c2 = st.columns(2)
+up_c1, up_c2, up_c3 = st.columns(3)
 with up_c1:
     with st.container(border=True):
         uploaded_inv = st.file_uploader(
-            "📂 1. 물류창고 재고파일 업로드 ('재고파일' 시트 양식)",
+            "📂 1. 물류창고 재고파일 업로드",
             type=["xlsx", "csv"],
             key="uploader_inv_main",
         )
 with up_c2:
     with st.container(border=True):
         uploaded_out = st.file_uploader(
-            "🚚 2. '일일출고 현황' 파일 업로드 (DOH·안전재고·로션 코드변경 합산·단종예상 분석)",
+            "🚚 2. '일일출고 현황' 파일 업로드",
             type=["xlsx", "xls", "csv"],
             key="uploader_outbound_main",
+        )
+with up_c3:
+    with st.container(border=True):
+        uploaded_nd = st.file_uploader(
+            "📉 3. '미납내역' 파일 업로드 (목표 미납률 산출)",
+            type=["xlsx", "xls"],
+            key="uploader_nondelivery_main",
         )
 
 if uploaded_inv is None:
@@ -874,13 +885,26 @@ if uploaded_out is not None:
     except Exception as e:
         st.warning(f"⚠️ '일일출고 현황' 파일 파싱 중 참고사항: {e}")
 
+nd_df = None
+nd_info = None
+if uploaded_nd is not None:
+    try:
+        nd_df, nd_info = parse_nondelivery_bytes(uploaded_nd.getvalue())
+    except Exception as e:
+        st.warning(f"⚠️ '미납내역' 파일 파싱 중 참고사항: {e}")
+
 st.success(
     f"✅ {meta['source_label']} 로드 완료 | 전체 {meta['raw_total_rows']:,}건 중 제외({', '.join(EXCLUDED_KEYWORDS)}) {meta['excluded_rows']:,}건 "
     f"({int(meta['excluded_qty']):,} EA) 반영 → **분석 대상 {meta['final_rows']:,}건 (고유 SKU {meta['unique_skus']:,}종)**"
     + (
-        f" | 🚚 일일출고({outbound_info['div_col']}: {'매출' if outbound_info['used_sales_filter'] else '전체'}) {outbound_info['rows']:,}건 ({outbound_info['date_range']}) 연동됨"
+        f" | 🚚 일일출고 {outbound_info['rows']:,}건 ({outbound_info['date_range']})"
         if outbound_info
-        else " | 💡 '일일출고 현황'을 올리면 실출고 기반 지표와 단종예상 재고가 자동 산출됩니다."
+        else ""
+    )
+    + (
+        f" | 📉 미납내역 {nd_info['rows']:,}건 (누적 {nd_info['total_amt']:,.0f}원, {nd_info['period_str']})"
+        if nd_info
+        else ""
     )
 )
 
@@ -1002,7 +1026,7 @@ if st.session_state["active_tab"] == "📊 브랜드·포트폴리오 현황":
             use_container_width=True,
             hide_index=True,
             height=240,
-            key="sku_brand_editor_v11",
+            key="sku_brand_editor_v12",
         )
 
         changed_pairs = {}
@@ -1105,7 +1129,6 @@ if st.session_state["active_tab"] == "📊 브랜드·포트폴리오 현황":
                     .properties(height=320)
                 )
                 st.altair_chart(melano_chart, use_container_width=True)
-                st.caption("💡 '엔자임페이스 워시' 막대에 마우스를 올리면 maf(디에이치, 메이크) / mam(마트) / mak(수입상태) 재고가 표시됩니다.")
             else:
                 st.bar_chart(
                     data=p_chart_df,
@@ -1197,7 +1220,6 @@ if st.session_state["active_tab"] == "📊 브랜드·포트폴리오 현황":
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    # 1번 & 4번: 브랜드·포트폴리오 현황 탭에서만 월별 예상 출고량 및 예상 재고 추이 선 그래프 표시
     st.markdown('<div class="section-title">📈 제품코드별 추후 월별 예상 출고량 및 예상 재고 추이(선 그래프)</div>', unsafe_allow_html=True)
 
     sku_list = sku_view["상품"].tolist()
@@ -1252,7 +1274,6 @@ if st.session_state["active_tab"] == "📊 브랜드·포트폴리오 현황":
         today_dt = date.today()
         rows_timeline = []
 
-        # 1번: 이전 실적은 모두 표시
         if not sku_m_hist.empty:
             for hr in sku_m_hist.itertuples(index=False):
                 rows_timeline.append(
@@ -1308,13 +1329,12 @@ if st.session_state["active_tab"] == "📊 브랜드·포트폴리오 현황":
         st.dataframe(styled_fc, use_container_width=True, hide_index=True, height=260)
 
 else:
-    # 4번, 5번, 6번: SCM 팔로우업 탭 (하단 월별 예상 선 그래프 제외, 전문 SCM 지표 구성)
     st.markdown('<div class="section-title">🛡️ 출고/수주 대비 커버리지(DOH) 및 안전재고(Safety Stock) 알림</div>', unsafe_allow_html=True)
 
     if outbound_df is None:
         st.info(
             "💡 현재 '일일출고 현황' 파일이 미업로드 상태입니다. 상단 **2. '일일출고 현황' 파일 업로드**에 출고 데이터를 올리면 "
-            "구분(매출)·Date·수량 기준으로 DOH, 회전율(ITO), 발주점(ROP), 결품예상일이 산출됩니다."
+            "실출고 기준으로 DOH, ROP 충족률, 연간 재고회전율(ITO), 예상 결품일이 산출됩니다."
         )
 
     p_c1, p_c2, p_c3 = st.columns(3)
@@ -1359,7 +1379,6 @@ else:
         else (100.0 if r["정상환산"] > 0 else 0.0),
         axis=1,
     )
-    # 연간 환산 재고회전율(ITO = 연간예상출고량 / 현재정상재고)
     scm_df["연간_재고회전율(ITO, 회)"] = scm_df.apply(
         lambda r: round((r["일평균_출고량"] * 365.0) / r["정상환산"], 2)
         if r["정상환산"] > 0 and r["일평균_출고량"] > 0
@@ -1383,7 +1402,6 @@ else:
     scm_df["예상_결품일"] = scm_df.apply(_stockout_date_str, axis=1)
 
     def _doh_status(r):
-        # 7번: 변경된 ME코드 로션 3종은 위험 필터에서 제외
         if is_migrated_lotion_code(r["상품"]):
             return "⚪ 로션코드변경_제외"
         if r["일평균_출고량"] <= 0:
@@ -1402,15 +1420,24 @@ else:
     ss_short_cnt = int(
         ((~scm_df["상품"].apply(is_migrated_lotion_code)) & (scm_df["안전재고_과부족(EA)"] < 0)).sum()
     )
-    avg_ito = round(float(scm_df[scm_df["연간_재고회전율(ITO, 회)"] > 0]["연간_재고회전율(ITO, 회)"].mean()), 2) if (scm_df["연간_재고회전율(ITO, 회)"] > 0).any() else 0.0
+    avg_ito = (
+        round(float(scm_df[scm_df["연간_재고회전율(ITO, 회)"] > 0]["연간_재고회전율(ITO, 회)"].mean()), 2)
+        if (scm_df["연간_재고회전율(ITO, 회)"] > 0).any()
+        else 0.0
+    )
+    avg_rop_fill = (
+        round(float(scm_df[scm_df["일평균_출고량"] > 0]["ROP_충족률(%)"].mean()), 1)
+        if (scm_df["일평균_출고량"] > 0).any()
+        else 0.0
+    )
 
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("🚨 위험 품목(로션변경 제외)", f"{danger_cnt:,}종")
     m2.metric("⚠️ 주의 품목(발주검토 필요)", f"{caution_cnt:,}종")
     m3.metric("🛡️ 안전재고 미달 품목", f"{ss_short_cnt:,}종")
-    m4.metric("🔄 평균 재고회전율(ITO)", f"{avg_ito:.2f}회/년")
+    m4.metric("🎯 평균 ROP 충족률", f"{avg_rop_fill:.1f}%")
+    m5.metric("🔄 평균 재고회전율(ITO)", f"{avg_ito:.2f}회/년")
 
-    # 2번 & 3번: 상단에 알림상태 필터 및 개별 ME코드 선택창 배치 후 하단에 그래프 표시
     st.markdown('<div class="section-title">📉 수입입고 리드타임 고려 커버리지(DOH) 위험 수준 그래프</div>', unsafe_allow_html=True)
 
     f_col1, f_col2, f_col3 = st.columns([1.4, 1.4, 1.2])
@@ -1539,7 +1566,6 @@ else:
         )
         st.altair_chart(single_chart, use_container_width=True)
 
-    # 5번 & 6번: SCM 전문 지표 테이블 (재고회전율 ITO, ROP 충족률, 안전재고 여유일수, 예상 결품일)
     st.markdown('<div class="section-title">📋 SCM 재고 건전성 및 발주·결품 관리 지표</div>', unsafe_allow_html=True)
     scm_cols = [
         "SCM_알림상태",
@@ -1558,6 +1584,56 @@ else:
         "예상_결품일",
     ]
     st.dataframe(filtered_scm[scm_cols], use_container_width=True, hide_index=True, height=340)
+
+    # 1번 & 2번: 미납내역 분석 및 전체 매출액 대비 목표 미납률 산출 섹션
+    st.markdown('<div class="section-title">📉 미납내역 분석 및 전체 매출액 대비 목표 미납률 설정</div>', unsafe_allow_html=True)
+
+    nd_c1, nd_c2 = st.columns([1.4, 1.0])
+    with nd_c1:
+        annual_revenue_krw = st.number_input(
+            "연간 전체 매출액(원) 입력 (미납률 산출 기준)",
+            min_value=100_000_000.0,
+            max_value=10_000_000_000_000.0,
+            value=10_000_000_000.0,
+            step=500_000_000.0,
+            format="%.0f",
+            key="scm_annual_revenue_input",
+        )
+    with nd_c2:
+        reduction_pct = st.slider(
+            "미납 감축 목표 비율(%)",
+            min_value=10.0,
+            max_value=70.0,
+            value=37.5,
+            step=2.5,
+            key="scm_target_reduction_pct",
+        )
+
+    if nd_df is not None and nd_info is not None:
+        ann_nd_amt = float(nd_info["annualized_amt"])
+        actual_rate_pct = (ann_nd_amt / float(annual_revenue_krw)) * 100.0
+        target_rate_pct = actual_rate_pct * (1.0 - float(reduction_pct) / 100.0)
+        target_ann_amt = ann_nd_amt * (1.0 - float(reduction_pct) / 100.0)
+
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("누적 미납금액", f"{nd_info['total_amt']:,.0f}원")
+        r2.metric("연환산 미납금액", f"{ann_nd_amt:,.0f}원/년")
+        r3.metric("매출 대비 실적 미납률", f"{actual_rate_pct:.2f}%")
+        r4.metric("매출 대비 목표 미납률", f"{target_rate_pct:.2f}% (목표액 {target_ann_amt:,.0f}원)")
+
+        cause_tbl = (
+            nd_df.groupby("원인대분류", as_index=False)
+            .agg(
+                건수=("미납금액_num", "count"),
+                미납수량=("미납수량_num", "sum"),
+                미납금액=("미납금액_num", "sum"),
+            )
+            .sort_values(by="미납금액", ascending=False)
+        )
+        cause_tbl["금액비중(%)"] = (cause_tbl["미납금액"] / max(nd_info["total_amt"], 1.0) * 100.0).round(2)
+        st.dataframe(cause_tbl, use_container_width=True, hide_index=True, height=240)
+    else:
+        st.info("💡 '미납내역' 엑셀 파일을 업로드하면 원인별 미납금액과 전체 매출액 대비 실적·목표 미납률이 자동 산출됩니다.")
 
     st.download_button(
         label="📥 SCM 커버리지(DOH)·안전재고·회전율 지표 엑셀 다운로드",
