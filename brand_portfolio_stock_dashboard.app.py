@@ -84,6 +84,68 @@ def is_migrated_lotion_code(code: str) -> bool:
     return False
 
 
+def _shift_years_safe(dt_obj: date, years_delta: int) -> date:
+    target_year = dt_obj.year + years_delta
+    try:
+        return dt_obj.replace(year=target_year)
+    except ValueError:
+        # 2월 29일 등 윤년 보정
+        return dt_obj.replace(year=target_year, month=2, day=28)
+
+
+def evaluate_shelf_life(mfg_val, exp_val, ref_date: date | None = None, shelf_life_years: int = 3) -> dict:
+    """
+    유통기한은 제조일로부터 3년(기본) 기준.
+    잔여일수 비율이 50% 미만이면 '유효일자 관리 품목'으로 분류.
+    """
+    today_d = ref_date or date.today()
+    exp_ts = pd.to_datetime(exp_val, errors="coerce")
+    if pd.isna(exp_ts):
+        return {
+            "잔여일수": None,
+            "총수명일수": None,
+            "잔여비율(%)": None,
+            "유효일자_관리구분": "⚪ 일자미기재",
+            "유효일자_관리대상": False,
+        }
+
+    exp_d = exp_ts.date()
+    mfg_ts = pd.to_datetime(mfg_val, errors="coerce")
+    has_valid_mfg = (
+        pd.notna(mfg_ts)
+        and mfg_ts.year >= 1950
+        and mfg_ts.date() < exp_d
+    )
+
+    if has_valid_mfg:
+        mfg_d = mfg_ts.date()
+        total_days = max((exp_d - mfg_d).days, 1)
+    else:
+        mfg_d = _shift_years_safe(exp_d, -int(shelf_life_years))
+        total_days = max((exp_d - mfg_d).days, 1)
+
+    rem_days = (exp_d - today_d).days
+    rem_ratio_pct = round((rem_days / float(total_days)) * 100.0, 1)
+
+    if rem_days < 0:
+        status_label = "🔴 만료경과(관리대상)"
+        is_manage = True
+    elif rem_ratio_pct < 50.0:
+        status_label = "⏳ 유효일자 관리(50% 미만)"
+        is_manage = True
+    else:
+        status_label = "✅ 정상(50% 이상)"
+        is_manage = False
+
+    return {
+        "잔여일수": int(rem_days),
+        "총수명일수": int(total_days),
+        "잔여비율(%)": rem_ratio_pct,
+        "유효일자_관리구분": status_label,
+        "유효일자_관리대상": is_manage,
+    }
+
+
 PORTFOLIO_OPTIONS = {
     "Lotion": ["75ml", "100ml", "450ml", "미분류(확인필요)"],
     "Spray": ["쿨", "딥앤쿨", "익스트림", "미분류(확인필요)"],
@@ -181,6 +243,7 @@ def parse_warehouse_bytes(file_bytes: bytes, file_name: str) -> tuple[pd.DataFra
                 "상품": df["상품"].astype(str).str.strip() if "상품" in df.columns else "",
                 "상품명": df["상품명"].fillna("").astype(str).str.strip() if "상품명" in df.columns else "",
                 "화주LOT": df["화주LOT"].fillna("-").astype(str).str.strip() if "화주LOT" in df.columns else "-",
+                "제조일자_raw": df["제조일자"] if "제조일자" in df.columns else None,
                 "유효일자_raw": df["유효일자"] if "유효일자" in df.columns else None,
                 "정상환산": pd.to_numeric(df[qty_col], errors="coerce").fillna(0.0) if qty_col else 0.0,
                 "불량환산": pd.to_numeric(df["불량수량_환산"], errors="coerce").fillna(0.0)
@@ -213,6 +276,7 @@ def parse_warehouse_bytes(file_bytes: bytes, file_name: str) -> tuple[pd.DataFra
         idx_prod = _find_col_index(row1, row2, "상품", 3)
         idx_name = _find_col_index(row1, row2, "상품명", 4)
         idx_lot = _find_col_index(row1, row2, "화주LOT", 6)
+        idx_mfg = _find_col_index(row1, row2, "제조일자", 12)
         idx_exp = _find_col_index(row1, row2, "유효일자", 13)
         idx_total = _find_col_index(row1, row2, "합계수량", 31)
 
@@ -260,6 +324,7 @@ def parse_warehouse_bytes(file_bytes: bytes, file_name: str) -> tuple[pd.DataFra
                     "상품": p_str,
                     "상품명": str(r[idx_name] or "").strip() if idx_name < len(r) else "",
                     "화주LOT": str(r[idx_lot] or "-").strip() if idx_lot < len(r) else "-",
+                    "제조일자_raw": r[idx_mfg] if idx_mfg < len(r) else None,
                     "유효일자_raw": r[idx_exp] if idx_exp < len(r) else None,
                     "정상환산": r[idx_norm_conv] if idx_norm_conv < len(r) else 0,
                     "불량환산": r[idx_bad_conv] if idx_bad_conv < len(r) else 0,
@@ -284,6 +349,10 @@ def parse_warehouse_bytes(file_bytes: bytes, file_name: str) -> tuple[pd.DataFra
     tot_num = pd.to_numeric(out["합계수량_raw"], errors="coerce")
     out["합계수량"] = tot_num.fillna(out["정상환산"] + out["불량환산"])
 
+    mfg_dt = pd.to_datetime(out["제조일자_raw"], errors="coerce")
+    raw_mfg_str = out["제조일자_raw"].astype(str).str.strip().replace({"None": "-", "nan": "-", "NaT": "-", "": "-"})
+    out["제조일자"] = mfg_dt.dt.strftime("%Y-%m-%d").fillna(raw_mfg_str)
+
     exp_dt = pd.to_datetime(out["유효일자_raw"], errors="coerce")
     raw_exp_str = out["유효일자_raw"].astype(str).str.strip().replace({"None": "-", "nan": "-", "NaT": "-", "": "-"})
     out["유효일자"] = exp_dt.dt.strftime("%Y-%m-%d").fillna(raw_exp_str)
@@ -293,7 +362,7 @@ def parse_warehouse_bytes(file_bytes: bytes, file_name: str) -> tuple[pd.DataFra
     excluded_rows = int(excl_mask.sum())
     excluded_qty = float(out.loc[excl_mask, "합계수량"].sum())
 
-    filtered = out[~excl_mask].drop(columns=["유효일자_raw", "합계수량_raw"]).reset_index(drop=True)
+    filtered = out[~excl_mask].drop(columns=["합계수량_raw"]).reset_index(drop=True)
 
     meta = {
         "source_label": source_label,
@@ -769,7 +838,7 @@ if "selected_forecast_sku" not in st.session_state:
 top_l, top_r = st.columns([1.35, 1.15])
 with top_l:
     st.title("📦 브랜드 및 포트폴리오별 통합 재고 현황")
-    st.caption("브랜드/포트폴리오 세분화 · 단종예상·부자재 자동분류 · 수입리드타임 기반 DOH·ROP·회전율·미납률 관리")
+    st.caption("브랜드/포트폴리오 세분화 · 유효일자(제조일+3년, 잔여 50% 미만) 관리 · 수입리드타임 기반 DOH·ROP·회전율·미납률 관리")
 
 with top_r:
     with st.container(border=True):
@@ -867,7 +936,10 @@ if st.session_state["custom_skus"]:
                     "상품": c_code,
                     "상품명": c_info.get("상품명", c_code),
                     "화주LOT": "-",
+                    "제조일자": "-",
                     "유효일자": "-",
+                    "제조일자_raw": None,
+                    "유효일자_raw": None,
                     "정상환산": 0.0,
                     "불량환산": 0.0,
                     "합계수량": 0.0,
@@ -940,6 +1012,15 @@ inv_merged["브랜드"] = inv_merged["브랜드"].fillna("미분류")
 inv_merged["최종_포트폴리오"] = inv_merged["최종_포트폴리오"].fillna("-")
 inv_merged["검수상태"] = inv_merged["검수상태"].fillna("해당없음")
 
+# 유통기한(제조일로부터 3년) 기준 잔여일수 비율 50% 미만 관리 품목 산출
+today_ref = date.today()
+shelf_eval_rows = [
+    evaluate_shelf_life(r.제조일자_raw, r.유효일자_raw, ref_date=today_ref, shelf_life_years=3)
+    for r in inv_merged.itertuples(index=False)
+]
+shelf_eval_df = pd.DataFrame(shelf_eval_rows, index=inv_merged.index)
+inv_merged = pd.concat([inv_merged, shelf_eval_df], axis=1)
+
 qty_metric = st.radio(
     "수량 기준 선택",
     options=["정상환산", "합계수량", "불량환산"],
@@ -951,12 +1032,14 @@ qty_metric = st.radio(
     horizontal=True,
 )
 
+exp_manage_qty = int(inv_merged[inv_merged["유효일자_관리대상"]][qty_metric].sum())
+
 k1, k2, k3, k4, k5 = st.columns(5)
 k1.metric("선택 기준 총 재고 (EA)", f"{int(inv_merged[qty_metric].sum()):,}")
 k2.metric("Acnes", f"{int(inv_merged[inv_merged['브랜드'] == 'Acnes'][qty_metric].sum()):,}")
 k3.metric("Lipcare", f"{int(inv_merged[inv_merged['브랜드'] == 'Lipcare'][qty_metric].sum()):,}")
 k4.metric("HADALABO", f"{int(inv_merged[inv_merged['브랜드'] == 'HADALABO'][qty_metric].sum()):,}")
-k5.metric("단종 예상 재고", f"{int(inv_merged[inv_merged['브랜드'] == '단종 예상 재고'][qty_metric].sum()):,}")
+k5.metric("⏳ 유효일자 관리(50% 미만)", f"{exp_manage_qty:,}")
 
 sku_qty = inv_merged.groupby("상품", as_index=False)[["정상환산", "불량환산", "합계수량"]].sum()
 sku_view = sku_classified.merge(sku_qty, on="상품", how="left").fillna(0)
@@ -976,7 +1059,8 @@ else:
     sku_view["일평균_출고량"] = (sku_view["정상환산"] / 30.0).round(2)
     sku_view["월예상_출고량"] = sku_view["정상환산"].round(0)
 
-v_col1, v_col2 = st.columns([1, 1])
+# 3개 전용 칸(브랜드·포트폴리오 현황 / SCM 팔로우업 / 유효일자 관리)
+v_col1, v_col2, v_col3 = st.columns([1, 1, 1])
 with v_col1:
     if st.button(
         "📊 브랜드 · 포트폴리오 현황 & 매핑 수정",
@@ -987,11 +1071,19 @@ with v_col1:
         st.rerun()
 with v_col2:
     if st.button(
-        "🛡️ SCM 팔로우업: 커버리지(DOH) & 안전재고(Safety Stock) 알림",
+        "🛡️ SCM 팔로우업: DOH & 안전재고 알림",
         type="primary" if st.session_state["active_tab"] == "🛡️ SCM 팔로우업" else "secondary",
         use_container_width=True,
     ):
         st.session_state["active_tab"] = "🛡️ SCM 팔로우업"
+        st.rerun()
+with v_col3:
+    if st.button(
+        "⏳ 유효일자 관리 (잔여 50% 미만)",
+        type="primary" if st.session_state["active_tab"] == "⏳ 유효일자 관리" else "secondary",
+        use_container_width=True,
+    ):
+        st.session_state["active_tab"] = "⏳ 유효일자 관리"
         st.rerun()
 
 if st.session_state["active_tab"] == "📊 브랜드·포트폴리오 현황":
@@ -1026,7 +1118,7 @@ if st.session_state["active_tab"] == "📊 브랜드·포트폴리오 현황":
             use_container_width=True,
             hide_index=True,
             height=240,
-            key="sku_brand_editor_v12",
+            key="sku_brand_editor_v13",
         )
 
         changed_pairs = {}
@@ -1181,7 +1273,23 @@ if st.session_state["active_tab"] == "📊 브랜드·포트폴리오 현황":
                 st.rerun()
 
     st.markdown(f"#### 📋 [{sel_brand}] 상세 재고 내역 (센터 · 셀 · LOT · 유효일자별)")
-    detail_cols = ["센터", "셀", "상품", "상품명", "최종_포트폴리오", "검수상태", "화주LOT", "유효일자", "정상환산", "불량환산", "합계수량"]
+    detail_cols = [
+        "센터",
+        "셀",
+        "상품",
+        "상품명",
+        "최종_포트폴리오",
+        "검수상태",
+        "화주LOT",
+        "제조일자",
+        "유효일자",
+        "잔여일수",
+        "잔여비율(%)",
+        "유효일자_관리구분",
+        "정상환산",
+        "불량환산",
+        "합계수량",
+    ]
     detail_df = brand_rows[detail_cols].sort_values(by=["최종_포트폴리오", "상품", "유효일자"])
     st.dataframe(detail_df, use_container_width=True, hide_index=True, height=340)
 
@@ -1328,7 +1436,7 @@ if st.session_state["active_tab"] == "📊 브랜드·포트폴리오 현황":
         )
         st.dataframe(styled_fc, use_container_width=True, hide_index=True, height=260)
 
-else:
+elif st.session_state["active_tab"] == "🛡️ SCM 팔로우업":
     st.markdown('<div class="section-title">🛡️ 출고/수주 대비 커버리지(DOH) 및 안전재고(Safety Stock) 알림</div>', unsafe_allow_html=True)
 
     if outbound_df is None:
@@ -1585,7 +1693,6 @@ else:
     ]
     st.dataframe(filtered_scm[scm_cols], use_container_width=True, hide_index=True, height=340)
 
-    # 1번 & 2번: 미납내역 분석 및 전체 매출액 대비 목표 미납률 산출 섹션
     st.markdown('<div class="section-title">📉 미납내역 분석 및 전체 매출액 대비 목표 미납률 설정</div>', unsafe_allow_html=True)
 
     nd_c1, nd_c2 = st.columns([1.4, 1.0])
@@ -1641,3 +1748,74 @@ else:
         file_name="SCM_커버리지_DOH_안전재고_지표.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+else:
+    # 전용 칸: 유효일자 관리 (유통기한 제조일로부터 3년 기준, 잔여일수 비율 50% 미만)
+    st.markdown('<div class="section-title">⏳ 유효일자 관리 전용 칸 (유통기한 3년 기준 · 잔여일수 50% 미만)</div>', unsafe_allow_html=True)
+    st.caption(
+        f"기준일: **{today_ref.strftime('%Y-%m-%d')}** | 유통기한: **제조일로부터 3년** | "
+        "잔여일수 비율이 **50% 미만**인 LOT/재고를 별도 관리 대상으로 분류합니다."
+    )
+
+    exp_target_df = inv_merged[inv_merged["유효일자_관리대상"]].copy()
+    expired_df = exp_target_df[exp_target_df["잔여일수"] < 0]
+    under_50_df = exp_target_df[exp_target_df["잔여일수"] >= 0]
+
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric("유효일자 관리 대상 LOT", f"{len(exp_target_df):,}건")
+    e2.metric("관리 대상 재고수량", f"{int(exp_target_df[qty_metric].sum()):,} EA")
+    e3.metric("잔여 50% 미만(유효)", f"{len(under_50_df):,}건 ({int(under_50_df[qty_metric].sum()):,} EA)")
+    e4.metric("만료 경과 LOT", f"{len(expired_df):,}건 ({int(expired_df[qty_metric].sum()):,} EA)")
+
+    if not exp_target_df.empty:
+        exp_brand_sum = (
+            exp_target_df.groupby(["브랜드", "유효일자_관리구분"], as_index=False)[qty_metric]
+            .sum()
+            .sort_values(by=qty_metric, ascending=False)
+        )
+        exp_chart = (
+            alt.Chart(exp_brand_sum)
+            .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+            .encode(
+                x=alt.X("브랜드:N", sort="-y", title="브랜드"),
+                y=alt.Y(f"{qty_metric}:Q", title="관리 대상 재고수량(EA)"),
+                color=alt.Color("유효일자_관리구분:N", title="관리 구분"),
+                tooltip=[
+                    alt.Tooltip("브랜드:N", title="브랜드"),
+                    alt.Tooltip("유효일자_관리구분:N", title="관리 구분"),
+                    alt.Tooltip(f"{qty_metric}:Q", title="재고수량(EA)", format=","),
+                ],
+            )
+            .properties(height=300)
+        )
+        st.altair_chart(exp_chart, use_container_width=True)
+
+        exp_cols = [
+            "유효일자_관리구분",
+            "브랜드",
+            "최종_포트폴리오",
+            "상품",
+            "상품명",
+            "센터",
+            "셀",
+            "화주LOT",
+            "제조일자",
+            "유효일자",
+            "잔여일수",
+            "총수명일수",
+            "잔여비율(%)",
+            "정상환산",
+            "불량환산",
+            "합계수량",
+        ]
+        exp_sorted = exp_target_df[exp_cols].sort_values(by=["잔여일수", "잔여비율(%)"], ascending=[True, True])
+        st.dataframe(exp_sorted, use_container_width=True, hide_index=True, height=360)
+
+        st.download_button(
+            label="📥 유효일자 관리 품목(잔여 50% 미만) 엑셀 다운로드",
+            data=to_excel_bytes(exp_sorted, sheet_name="유효일자_관리_50미만"),
+            file_name="유효일자_관리_품목_50미만.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        st.success("✅ 현재 기준일 기준으로 유통기한 잔여일수 50% 미만인 유효일자 관리 대상 LOT가 없습니다.")
