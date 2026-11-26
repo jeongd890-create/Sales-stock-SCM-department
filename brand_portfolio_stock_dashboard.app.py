@@ -1262,4 +1262,6 @@ if st.session_state["active_tab"] == "📊 브랜드·포트폴리오 현황":
                         "포트폴리오 (클릭 수정)", options=PORTFOLIO_OPTIONS[sel_brand], required=True
                     ),
                     "검수상태": st.column_config.TextColumn("검수상태", disabled=True),
-                    "판별근거": st.column_config.TextColumn("판별근거")
+                    "판별근거": st.column_config.TextColumn("판별근거"),
+    },
+)
